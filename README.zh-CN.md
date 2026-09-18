@@ -1,5 +1,11 @@
 # wake
 
+[![Validate skill](https://github.com/Gordon-Jang/codex-wake/actions/workflows/validate.yml/badge.svg)](https://github.com/Gordon-Jang/codex-wake/actions/workflows/validate.yml)
+[![GitHub release](https://img.shields.io/github/v/release/Gordon-Jang/codex-wake)](https://github.com/Gordon-Jang/codex-wake/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+[English](README.md) · [简体中文](README.zh-CN.md)
+
 **wake** 是一个用于 Codex 的轻量 Skill，目标是让长任务在被中断后按照统一节拍重新尝试，并继续**同一个对话**里的未完成工作。
 
 启用 `$wake` 后，所有使用 WAKE 的对话都对齐到统一的 15 分钟时间栅格：
