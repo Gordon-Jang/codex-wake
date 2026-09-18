@@ -1,0 +1,7 @@
+interface:
+  display_name: "Wake"
+  short_description: "Resume long Codex tasks on a synchronized quarter-hour schedule."
+  default_prompt: "Use $wake to keep this Codex conversation continuing on the shared quarter-hour schedule until the task is complete."
+
+policy:
+  allow_implicit_invocation: false
