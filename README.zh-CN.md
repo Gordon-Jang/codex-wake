@@ -6,25 +6,64 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
-**wake** 是一个用于 Codex 的轻量 Skill，目标是让长任务在被中断后按照统一节拍重新尝试，并继续**同一个对话**里的未完成工作。
+**wake** 是一个用于 Codex 的轻量 Skill：让长任务在中断后自动续作，同时避免反复“摇醒”那些实际上正在等待用户的对话。
 
-启用 `$wake` 后，所有使用 WAKE 的对话都对齐到统一的 15 分钟时间栅格：
+所有启用 WAKE 的对话仍然对齐到统一的 15 分钟时间栅格：
 
 `HH:00 · HH:15 · HH:30 · HH:45`
 
-这样可以避免不同对话按各自创建时间错峰运行。
-
 > [!IMPORTANT]
-> WAKE **不会也不能绕过** OpenAI 的使用额度、速率限制、配额或其他服务限制。它只是在正常可用性恢复后，按计划再次尝试继续当前对话。
+> WAKE **不会也不能绕过** OpenAI 的使用额度、速率限制、配额或其他服务限制。它只是在正常可用性恢复后按计划再次尝试。
+
+## v0.2 新变化
+
+v0.1 是简单的每刻钟续作。对于额度耗尽、临时网络错误很好用，但如果 Codex 其实在等你，就会出现每 15 分钟重复发“继续”的情况。
+
+v0.2 改成状态机：
+
+```text
+ACTIVE             → 已经在工作，不重复启动
+WAITING_USER       → 等用户，暂停 WAKE
+RETRYABLE_BLOCKED  → 临时限制，保留计划等待下次
+RUNNABLE           → 可以继续，接着做
+DONE               → 已完成，删除 WAKE
+UNKNOWN            → 只问一次，然后暂停
+```
+
+最重要的是 `WAITING_USER`。
+
+例如 Codex 已经说：
+
+```text
+请完成进程树重启，然后告诉我。
+```
+
+下一次 WAKE 检测到这是必须由你完成的操作后，会**立即暂停自己的计划任务**，而不是继续每 15 分钟发一次“继续当前任务”。
+
+等你回来回复：
+
+```text
+已经重启好了，继续。
+```
+
+WAKE 可以重新启用原来的计划任务。如果当前版本没有触发隐式 re-arm，直接附带：
+
+```text
+$wake
+```
+
+即可。
+
+完整状态机见 [docs/state-machine.md](docs/state-machine.md)。
 
 ## 命令
 
 | 命令 | 作用 |
 |---|---|
-| `$wake` | 为当前对话开启 WAKE |
+| `$wake` | 开启或重新武装当前对话的 WAKE |
 | `$wake start` | 与 `$wake` 相同 |
-| `$wake stop` | 关闭当前对话的 WAKE |
-| `$wake status` | 查看状态，不修改计划 |
+| `$wake stop` | 停止当前对话的 WAKE |
+| `$wake status` | 查看启用/暂停/停止状态，不修改计划 |
 
 ## 安装
 
@@ -44,23 +83,21 @@ cd codex-wake
 ./scripts/install.sh
 ```
 
-安装脚本会把 Skill 安装到：
+安装到：
 
 ```text
 ~/.agents/skills/wake/
 ```
 
-也可以把本仓库的 `SKILL.md` 放到某个项目的：
+项目内安装则放到：
 
 ```text
-<你的项目>/.agents/skills/wake/SKILL.md
+<你的项目>/.agents/skills/wake/
 ```
-
-如需 UI 元数据，可以一并复制 `agents/`。
 
 ## 使用
 
-在 Codex 对话里：
+开始：
 
 ```text
 把这个项目剩下的工作全部完成。
@@ -68,19 +105,21 @@ cd codex-wake
 $wake
 ```
 
-查看状态：
+查看：
 
 ```text
 $wake status
 ```
 
-人工停止：
+停止：
 
 ```text
 $wake stop
 ```
 
-## 同步唤醒机制
+如果 WAKE 因为等待你而暂停，正常回复它要求的信息或完成情况即可；没有自动恢复时，再输入一次 `$wake`。
+
+## 同步唤醒
 
 假设：
 
@@ -90,7 +129,7 @@ B 在 12:06 开启
 C 在 12:11 开启
 ```
 
-WAKE 不会让它们分别从启用时刻开始每隔 15 分钟运行，而是统一对齐到：
+WAKE 统一对齐到：
 
 ```text
 12:15   A B C
@@ -99,68 +138,57 @@ WAKE 不会让它们分别从启用时刻开始每隔 15 分钟运行，而是�
 13:00   A B C
 ```
 
+而不是从各自开启时间独立计算 15 分钟。
+
 推荐 recurrence：
 
 ```text
 RRULE:FREQ=HOURLY;BYMINUTE=0,15,30,45;BYSECOND=0
 ```
 
-实际开始执行的时间可能因调度器、本机状态、服务可用性和账户额度而稍有延迟。
+## 工作原理
 
-## 工作方式
+WAKE 使用**当前对话内 Scheduled Task**。每次运行先判断状态，再决定是否继续：
 
-每次计划唤醒时，WAKE 要求 Codex：
+| 状态 | 含义 | 行为 |
+|---|---|---|
+| ACTIVE | 工作已经在进行 | 不重复启动 |
+| WAITING_USER | 需要用户回答/批准/手动操作 | 暂停 WAKE |
+| RETRYABLE_BLOCKED | quota/rate/network/service 临时失败 | 保留计划 |
+| RUNNABLE | 当前可以继续 | 继续未完成工作 |
+| DONE | 原任务已经完成 | 删除 WAKE |
+| UNKNOWN | 不确定是否需要用户 | 问一次并暂停 |
 
-1. 回到**当前同一对话**。
-2. 检查已有代码、文件、测试和项目状态。
-3. 保留已经完成且有效的工作。
-4. 找出原任务尚未完成的部分。
-5. 从中断位置继续，而不是重新开始。
-6. 遇到 usage limit、quota、rate limit 或临时网络/服务问题时保留现状，等待下一个同步节点。
-7. 确认任务全部完成后，关闭当前对话自己的 WAKE 计划任务。
+所以你截图里的“等待用户重启进程树”会进入 `WAITING_USER`，不会继续在后续每个刻钟重复发送计划消息。
 
-`$wake start` 被设计成幂等操作：重复调用时应尽量复用已有 WAKE 任务，而不是创建重复计划。
+## 为什么暂时没有默认启用“中央 Supervisor”
+
+Codex App Server 已经提供了很适合 Supervisor 的能力，例如不恢复线程的 `thread/read`、线程运行状态、审批事件和用户输入请求。
+
+但 v0.2 没有默认启用跨线程 Supervisor：外部进程目前没有一个公开且普遍可靠的方法，能够确保自己连接的就是 Codex Desktop 中那个**正在显示和运行的实时线程实例**。单独启动 App Server 可以读持久化历史，但持久化状态并不总等价于桌面端的实时状态。
+
+如果现在强行做中央 Supervisor，就可能在状态过期时错误唤醒一个其实还在工作的线程。v0.2 先采用对话内的“等待用户自动暂停 + 用户回来后 re-arm”，可以可靠解决重复摇醒问题，同时不冒这个风险。
 
 ## 限制
 
 - 需要支持 Skills 的 Codex / ChatGPT 环境。
-- 账户或工作区需要支持 Scheduled Tasks / Automations。
-- 如果计划任务需要访问本地文件，电脑和相关桌面应用可能需要保持运行。
-- WAKE 无法保证每一次计划执行都能获得模型容量。
-- WAKE 不会绕过 quota、rate limit 或其他平台限制。
-- Codex 与 Scheduled Tasks 会持续演进，未来产品行为可能发生变化。
-
-## 项目结构
-
-```text
-codex-wake/
-├─ SKILL.md
-├─ agents/
-│  └─ openai.yaml
-├─ .github/
-│  └─ workflows/
-│     └─ validate.yml
-├─ scripts/
-│  ├─ install.ps1
-│  ├─ uninstall.ps1
-│  ├─ install.sh
-│  └─ uninstall.sh
-├─ CHANGELOG.md
-├─ CONTRIBUTING.md
-├─ LICENSE
-├─ README.md
-├─ README.zh-CN.md
-└─ SECURITY.md
-```
+- 账户或工作区需要支持 Scheduled Tasks。
+- 使用本地文件时，电脑和桌面应用可能需要保持运行。
+- 第一次发现 `WAITING_USER` 时仍可能出现一次计划任务消息；v0.2 的目标是从那以后暂停，避免后续重复消息。
+- 隐式 re-arm 依赖当前主机/模型是否选择该 Skill；显式 `$wake` 始终是可靠后备方案。
+- WAKE 无法保证模型容量，也不会绕过 quota/rate limit。
+- Codex 与 Scheduled Tasks 仍在持续演进。
 
 ## 官方资料
 
 - OpenAI — Build skills  
   https://developers.openai.com/docs/build-skills
-- OpenAI — Customization / skills  
-  https://developers.openai.com/docs/customization/overview
 - OpenAI — Scheduled tasks / automations  
   https://developers.openai.com/docs/automations
+- OpenAI — Codex App Server  
+  https://developers.openai.com/docs/app-server
+- Codex Desktop 活动线程外部挂接讨论  
+  https://github.com/openai/codex/issues/25914
 
 ## License
 
