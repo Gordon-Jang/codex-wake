@@ -1,7 +1,7 @@
 interface:
   display_name: "Wake"
-  short_description: "Resume long Codex tasks on a synchronized quarter-hour schedule."
-  default_prompt: "Use $wake to keep this Codex conversation continuing on the shared quarter-hour schedule until the task is complete."
+  short_description: "State-aware continuation for long Codex tasks without repeatedly waking user-blocked threads."
+  default_prompt: "Use $wake to keep this Codex conversation continuing on the shared quarter-hour schedule. Pause automatically when user input is required, and re-arm after the user resolves the blocker."
 
 policy:
-  allow_implicit_invocation: false
+  allow_implicit_invocation: true
