@@ -7,62 +7,69 @@
 [English](README.md) · [简体中文](README.zh-CN.md)
 
 **wake** is a small Codex skill for keeping long-running work alive across
-interruptions.
+interruptions without repeatedly waking conversations that are waiting for the
+user.
 
-Invoke `$wake` in a Codex conversation and the skill asks Codex to attach a
-scheduled continuation to that same conversation. All WAKE-enabled conversations
-use the same quarter-hour wall-clock grid:
+All WAKE-enabled conversations use the same quarter-hour wall-clock grid:
 
 `HH:00 · HH:15 · HH:30 · HH:45`
 
-That avoids the common "A wakes at :02, B at :07, C at :12" drift you get from
-independent "every 15 minutes from now" timers.
-
 > [!IMPORTANT]
 > WAKE does **not** bypass OpenAI usage limits, quotas, rate limits, or service
-> restrictions. It only schedules another continuation attempt after normal
+> restrictions. It only schedules later continuation attempts after normal
 > availability returns.
 
-## Why
+## What's new in v0.2
 
-Long Codex tasks can be interrupted by usage limits, transient network failures,
-temporary service availability, or simply because work needs to continue over
-multiple runs.
+v0.1 used a simple quarter-hour continuation loop. That works for quota and
+transient failures, but it can become noisy when Codex is actually waiting for
+the user.
 
-WAKE gives each conversation a simple lifecycle:
+v0.2 adds a state machine:
 
 ```text
-$wake
-  ↓
-continue current work
-  ↓
-interrupted / limited
-  ↓
-next synchronized quarter-hour
-  ↓
-return to the same conversation
-  ↓
-continue from existing state
-  ↓
-task complete
-  ↓
-stop its own WAKE schedule
+ACTIVE             → do not duplicate work
+WAITING_USER       → pause WAKE
+RETRYABLE_BLOCKED  → keep schedule and retry later
+RUNNABLE           → continue unfinished work
+DONE               → remove WAKE
+UNKNOWN            → ask once, then pause
 ```
+
+The important change is `WAITING_USER`.
+
+If Codex says something like:
+
+```text
+Restart the process tree and tell me when it is ready.
+```
+
+the next WAKE run should detect that progress requires a manual user action,
+pause its own schedule, and stop sending quarter-hour "continue" messages.
+
+When the user comes back with:
+
+```text
+Restart complete, continue.
+```
+
+WAKE can re-arm the existing schedule. If implicit re-arm is not selected by the
+host/model, `$wake` explicitly re-enables it.
+
+See [docs/state-machine.md](docs/state-machine.md) for the complete lifecycle.
 
 ## Commands
 
 | Command | Behavior |
 |---|---|
-| `$wake` | Start WAKE for the current conversation |
+| `$wake` | Start or re-arm WAKE for the current conversation |
 | `$wake start` | Same as `$wake` |
 | `$wake stop` | Stop WAKE for the current conversation |
-| `$wake status` | Show current WAKE state without changing it |
+| `$wake status` | Show enabled/paused/stopped state without changing it |
 
 ## Install
 
-### Option A — clone and install globally
-
-Windows PowerShell:
+### Windows PowerShell
 
 ```powershell
 git clone https://github.com/Gordon-Jang/codex-wake.git
@@ -70,7 +77,7 @@ cd codex-wake
 .\scripts\install.ps1
 ```
 
-macOS / Linux:
+### macOS / Linux
 
 ```bash
 git clone https://github.com/Gordon-Jang/codex-wake.git
@@ -86,9 +93,9 @@ The installer copies the skill to:
 
 Codex reads user-level skills from `~/.agents/skills`.
 
-### Option B — use only inside one repository
+### Repository-local install
 
-Copy this repository's `SKILL.md` (and `agents/` metadata if desired) into:
+Copy this repository's `SKILL.md` and optional `agents/` metadata into:
 
 ```text
 <your-repo>/.agents/skills/wake/
@@ -96,7 +103,7 @@ Copy this repository's `SKILL.md` (and `agents/` metadata if desired) into:
 
 ## Usage
 
-In a new or existing Codex conversation:
+Start:
 
 ```text
 Finish the remaining work in this project.
@@ -104,19 +111,26 @@ Finish the remaining work in this project.
 $wake
 ```
 
-You can then check it:
+Check status:
 
 ```text
 $wake status
 ```
 
-Or stop it manually:
+Stop:
 
 ```text
 $wake stop
 ```
 
-### Synchronization model
+If WAKE paused because it needed you, respond to the pending request normally.
+If it does not automatically re-arm, add:
+
+```text
+$wake
+```
+
+## Synchronization model
 
 If three conversations enable WAKE at different times:
 
@@ -126,7 +140,7 @@ B enabled at 12:06
 C enabled at 12:11
 ```
 
-the intended wake grid is still:
+the intended wake grid is:
 
 ```text
 12:15   A B C
@@ -140,15 +154,59 @@ rather than three independent 15-minute offsets.
 Actual execution can occur slightly after the nominal scheduled time depending on
 the scheduler, machine state, service availability, and account limits.
 
+## How it works
+
+WAKE uses an **in-conversation Scheduled Task** so each run returns to the same
+conversation and retains its existing context.
+
+Before continuing project work, each scheduled run classifies the conversation:
+
+| State | Meaning | Action |
+|---|---|---|
+| ACTIVE | Work is already progressing | Do not duplicate work |
+| WAITING_USER | User input/manual action is required | Pause WAKE |
+| RETRYABLE_BLOCKED | Quota/rate/network/service issue | Keep schedule |
+| RUNNABLE | Work can continue now | Continue |
+| DONE | Requested work is complete | Remove WAKE |
+| UNKNOWN | User dependency is unclear | Ask once and pause |
+
+The preferred recurrence is:
+
+```text
+RRULE:FREQ=HOURLY;BYMINUTE=0,15,30,45;BYSECOND=0
+```
+
+## Why not a global supervisor yet?
+
+Codex App Server exposes useful primitives such as non-resuming `thread/read`,
+runtime thread status, approvals, and user-input requests. Those are promising
+building blocks for a single supervisor that scans many threads.
+
+WAKE v0.2 intentionally does **not** enable cross-thread supervision by default.
+An external process does not currently have a documented, generally safe way to
+attach to the exact active Codex Desktop runtime instance for every visible
+thread. A separate App Server can inspect persisted history, but persisted state
+is not always the same thing as Desktop's live runtime state.
+
+Shipping an aggressive supervisor today could therefore wake an already-active
+thread or act on stale state. The conversation-local pause/re-arm design solves
+the repeated WAITING_USER wakeups without taking that risk.
+
+See [docs/state-machine.md](docs/state-machine.md).
+
 ## Requirements and limitations
 
-- A Codex/ChatGPT environment that supports skills.
-- Scheduled tasks must be available for the account/workspace.
+- A Codex/ChatGPT environment that supports Skills.
+- Scheduled Tasks must be available for the account/workspace.
 - For scheduled work that needs local files, the computer and relevant desktop
   app may need to remain running.
-- WAKE cannot guarantee that a scheduled run receives model capacity.
+- One scheduled run may still appear when it first discovers WAITING_USER;
+  v0.2 prevents the later repeated wakeups by pausing the schedule.
+- Implicit re-arm depends on skill selection by the host/model. Explicit
+  `$wake` is the reliable fallback.
+- WAKE cannot guarantee model capacity.
 - WAKE cannot bypass quota or rate limits.
-- Scheduler behavior and product capabilities may evolve over time.
+- Scheduler and Codex product behavior may evolve.
 
 ## Repository layout
 
@@ -157,9 +215,13 @@ codex-wake/
 ├─ SKILL.md
 ├─ agents/
 │  └─ openai.yaml
+├─ docs/
+│  └─ state-machine.md
 ├─ .github/
-│  └─ workflows/
-│     └─ validate.yml
+│  ├─ workflows/
+│  │  ├─ validate.yml
+│  │  └─ release.yml
+│  └─ release-notes/
 ├─ scripts/
 │  ├─ install.ps1
 │  ├─ uninstall.ps1
@@ -170,34 +232,20 @@ codex-wake/
 ├─ LICENSE
 ├─ README.md
 ├─ README.zh-CN.md
-└─ SECURITY.md
+├─ SECURITY.md
+└─ VERSION
 ```
-
-## How it works
-
-The skill tells Codex to create an **in-conversation scheduled task** and to
-return to the same conversation on each scheduled run. It also asks Codex to
-reuse an existing WAKE task instead of creating duplicates, inspect the existing
-project state before making changes, and remove its own schedule after the
-original task is complete.
-
-The preferred recurrence is:
-
-```text
-RRULE:FREQ=HOURLY;BYMINUTE=0,15,30,45;BYSECOND=0
-```
-
-When a scheduling surface does not expose RRULE directly, the skill asks for the
-closest equivalent aligned to the same wall-clock boundaries.
 
 ## Official references
 
 - OpenAI — Build skills:
   https://developers.openai.com/docs/build-skills
-- OpenAI — Customization / skills:
-  https://developers.openai.com/docs/customization/overview
 - OpenAI — Scheduled tasks / automations:
   https://developers.openai.com/docs/automations
+- OpenAI — Codex App Server:
+  https://developers.openai.com/docs/app-server
+- OpenAI Codex issue tracking active Desktop attachment:
+  https://github.com/openai/codex/issues/25914
 
 ## Contributing
 
@@ -211,5 +259,3 @@ MIT. See [LICENSE](LICENSE).
 
 This is an independent community project. It is not an official OpenAI product
 and is not affiliated with or endorsed by OpenAI.
-
-“OpenAI”, “ChatGPT”, and “Codex” may be trademarks of their respective owner.
