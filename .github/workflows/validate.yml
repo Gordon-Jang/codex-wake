@@ -14,16 +14,23 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Validate SKILL.md
+      - name: Validate WAKE metadata and state machine
         shell: python
         run: |
           from pathlib import Path
           import re
 
-          path = Path("SKILL.md")
-          assert path.is_file(), f"Missing {path}"
+          skill = Path("SKILL.md")
+          agent = Path("agents/openai.yaml")
+          state_doc = Path("docs/state-machine.md")
 
-          text = path.read_text(encoding="utf-8")
+          assert skill.is_file(), "Missing SKILL.md"
+          assert agent.is_file(), "Missing agents/openai.yaml"
+          assert state_doc.is_file(), "Missing docs/state-machine.md"
+
+          text = skill.read_text(encoding="utf-8")
+          agent_text = agent.read_text(encoding="utf-8")
+
           assert text.startswith("---\n"), "SKILL.md must start with YAML frontmatter"
           assert re.search(r"(?m)^name:\s*wake\s*$", text), "name must be wake"
           assert re.search(r"(?m)^description:\s*>?\s*$", text), "description is required"
@@ -34,11 +41,24 @@ jobs:
               "$wake stop",
               "$wake status",
               "BYMINUTE=0,15,30,45",
+              "ACTIVE",
+              "WAITING_USER",
+              "RETRYABLE_BLOCKED",
+              "RUNNABLE",
+              "DONE",
+              "UNKNOWN",
+              "PAUSE or DISABLE",
+              "RE-ARM AFTER USER INPUT",
           ]
           for item in required:
-              assert item in text, f"Missing required content: {item}"
+              assert item in text, f"Missing required SKILL.md content: {item}"
 
-          print("SKILL.md validation passed.")
+          assert re.search(
+              r"(?m)^\s*allow_implicit_invocation:\s*true\s*$",
+              agent_text,
+          ), "v0.2 requires implicit invocation for the re-arm path"
+
+          print("WAKE v0.2 validation passed.")
 
       - name: Check shell scripts
         run: |
