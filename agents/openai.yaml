@@ -1,7 +1,7 @@
 interface:
   display_name: "Wake"
-  short_description: "State-aware continuation for long Codex tasks without repeatedly waking user-blocked threads."
-  default_prompt: "Use $wake to keep this Codex conversation continuing on the shared quarter-hour schedule. Pause automatically when user input is required, and re-arm after the user resolves the blocker."
+  short_description: "Quota-aware continuation for long Codex tasks with a local watcher and safe Scheduled Task fallback."
+  default_prompt: "Use $wake to keep this Codex conversation progressing. Prefer the local quota watcher only when an exact thread id is available; pause while waiting for the user; never guess a thread id or bypass usage limits."
 
 policy:
   allow_implicit_invocation: true
