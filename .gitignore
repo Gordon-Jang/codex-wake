@@ -1,3 +1,9 @@
+# Runtime state
+.state/
+*.log
+__pycache__/
+*.py[cod]
+
 # OS
 .DS_Store
 Thumbs.db
