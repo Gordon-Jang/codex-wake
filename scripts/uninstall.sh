@@ -1,15 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-TARGET="$HOME/.agents/skills/wake"
-
-if [[ -d "$TARGET" ]]; then
-  rm -rf "$TARGET"
-  echo "WAKE removed from:"
-  echo "  $TARGET"
-else
-  echo "WAKE is not installed at:"
-  echo "  $TARGET"
+TARGET="$HOME/.codex/skills/wake"
+if [[ -x "$TARGET/scripts/stop-watcher.sh" ]]; then
+  "$TARGET/scripts/stop-watcher.sh" || true
 fi
-
-echo "Restart Codex if the skill still appears in the skill picker."
+rm -rf "$TARGET"
+echo "WAKE removed: $TARGET"
