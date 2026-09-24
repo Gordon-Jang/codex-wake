@@ -1,8 +1,33 @@
 # Changelog
 
-All notable changes to this project will be documented here.
+## [0.3.2] - 2026-09-24
 
-The project follows a lightweight interpretation of Keep a Changelog.
+### Added
+
+- Local quota watcher backed by `codex app-server`.
+- Exact current-thread registration from `CODEX_THREAD_ID`.
+- Current-thread register/pause/resume/unregister helpers for Windows, macOS, and Linux.
+- Account-level quota transition handling: `monitoring -> quota_waiting -> monitoring`.
+- Windows `.cmd` wrappers so PowerShell execution policy does not block common operations.
+
+### Changed
+
+- `ordinaryUsageAllowed` is the authoritative quota-recovery signal.
+- `resetsAt` is used only to schedule the next check.
+- Default Skill installation path is `~/.codex/skills/wake`.
+- WAITING_USER registrations are excluded from quota recovery.
+
+### Fixed
+
+- Correct App Server `initialize -> initialized -> account/rateLimits/read` handshake.
+- Keep watcher state under `~/.codex/skills/wake/.state`.
+- Do not wake newly registered threads immediately while quota is healthy.
+- Do not print the raw account id in normal quota summaries.
+
+### Known limitation
+
+- Exact quota recovery currently resumes through detached `codex exec resume <thread-id>`;
+  Codex Desktop UI synchronization may vary by version.
 
 ## [0.2.0] - 2026-09-19
 
@@ -13,21 +38,11 @@ The project follows a lightweight interpretation of Keep a Changelog.
 - Automatic pause when progress requires user input, approval, credentials,
   confirmation, restart, or another manual action.
 - Re-arm flow after the user resolves a WAITING_USER blocker.
-- Optional implicit invocation for re-arming an already-paused WAKE conversation.
-- State-machine documentation and central-supervisor design notes.
-
-### Changed
-
-- WAKE no longer treats every unfinished conversation as immediately runnable.
-- Scheduled runs classify state before doing project work.
-- `$wake status` now reports paused state and pause reason when available.
-- README documentation now explains why a central cross-thread supervisor is not
-  enabled by default yet.
+- State-machine documentation.
 
 ### Fixed
 
-- Prevent repeated quarter-hour "continue" wakeups when Codex is actually waiting
-  for the user to answer a question or complete a manual step.
+- Prevent repeated quarter-hour wakeups while Codex is waiting for the user.
 
 ## [0.1.0] - 2026-09-18
 
@@ -36,9 +51,6 @@ The project follows a lightweight interpretation of Keep a Changelog.
 - Initial public WAKE skill.
 - `$wake`, `$wake start`, `$wake stop`, and `$wake status`.
 - Shared quarter-hour synchronization at `:00 / :15 / :30 / :45`.
-- Duplicate-schedule prevention guidance.
-- Automatic stop guidance after task completion.
-- Windows PowerShell install/uninstall scripts.
-- macOS/Linux install/uninstall scripts.
+- Windows/macOS/Linux install scripts.
 - English and Simplified Chinese documentation.
 - GitHub Actions validation.
