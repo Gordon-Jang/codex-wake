@@ -1,257 +1,199 @@
 ---
 name: wake
 description: >
-  Manage state-aware synchronized continuation for the current Codex conversation.
-  Explicitly invoke with $wake, $wake start, $wake stop, or $wake status.
-  Use implicitly only when a conversation already using WAKE resumes after the
-  user supplies previously requested input, confirmation, approval, or a manual
-  action. Do not start WAKE implicitly for unrelated tasks.
+  Manage state-aware continuation for the current Codex conversation. Prefer the
+  local quota watcher when installed: register the exact current Codex thread via
+  CODEX_THREAD_ID, monitor account quota locally, and wake the thread when ordinary
+  usage becomes available again. Fall back to synchronized Scheduled Tasks when
+  exact-thread registration or the watcher is unavailable. Explicitly invoke with
+  $wake, $wake start, $wake stop, or $wake status. Re-arm implicitly only when the
+  user resolves a blocker in a conversation already using WAKE.
 ---
 
 # WAKE
 
-WAKE manages state-aware synchronized continuation for the CURRENT conversation.
+WAKE keeps long Codex work moving without blindly retrying quota every 15 minutes.
 
-Its job is not to blindly send "continue" every 15 minutes. Before doing work,
-every scheduled WAKE run must classify the conversation state and act on that
-state.
+## Backends
 
-## Commands
+### Local quota watcher
 
-- `$wake`
-  Same as `$wake start`.
+Preferred for quota exhaustion:
 
-- `$wake start`
-  Enable or re-enable synchronized continuation for the current conversation.
+- register the exact current thread from `CODEX_THREAD_ID`
+- read limits locally through `codex app-server`
+- use `ordinaryUsageAllowed` as the recovery authority
+- use `resetsAt` only as a hint for when to check again
+- resume only exact registered threads that observed quota blocking
+- never use `--last` and never guess a thread id
 
-- `$wake stop`
-  Disable or remove the WAKE scheduled task belonging to the current conversation.
+### Scheduled Task fallback
 
-- `$wake status`
-  Report whether WAKE is enabled, paused, or stopped; include the pause reason
-  and next scheduled wake when available. Do not modify the schedule.
-
-## START
-
-When `$wake` or `$wake start` is explicitly invoked:
-
-1. Operate on the CURRENT conversation.
-2. Do not create a new conversation or thread for continuation.
-3. Check whether this conversation already has a WAKE scheduled task.
-4. If one already exists, update, resume, or reuse it instead of creating a duplicate.
-5. Align it to the shared quarter-hour wall-clock grid.
-
-Use this recurrence rule when the scheduling interface accepts RRULE:
+Use the synchronized quarter-hour grid only when the watcher cannot safely handle
+the thread, or for non-quota transient failures:
 
 `RRULE:FREQ=HOURLY;BYMINUTE=0,15,30,45;BYSECOND=0`
 
-The intended synchronized schedule is:
+## Commands
 
-- HH:00
-- HH:15
-- HH:30
-- HH:45
+- `$wake` — same as `$wake start`
+- `$wake start` — enable or re-arm WAKE
+- `$wake stop` — unregister/stop WAKE for this conversation
+- `$wake status` — report backend and state without modifying it
 
-Do NOT implement this as "every 15 minutes from the moment WAKE was enabled".
+## START
 
-If an explicit start time is required, use the next upcoming quarter-hour
-boundary in the user's local timezone while preserving the synchronized
-quarter-hour recurrence.
+When `$wake` or `$wake start` is invoked:
 
-If the scheduling surface does not expose RRULE directly, create the closest
-equivalent schedule that still aligns runs to :00, :15, :30 and :45.
+1. Operate on the CURRENT conversation only.
+2. Do not create or infer another thread.
+3. Start the local watcher if installed and not already running.
+4. From a shell/tool execution inside THIS conversation, register the exact current thread.
+
+Windows:
+
+`"$HOME\.codex\skills\wake\scripts\register-current.cmd"`
+
+macOS/Linux:
+
+`"$HOME/.codex/skills/wake/scripts/register-current.sh"`
+
+The helper must obtain the id from `CODEX_THREAD_ID`. Never substitute recency,
+title, project path, ordering, or `--last`.
+
+5. If exact registration succeeds, prefer the watcher for quota recovery.
+6. Use at most one synchronized Scheduled Task as fallback when useful.
 
 ## STATE MACHINE
 
-At the beginning of EVERY scheduled WAKE run, classify the current conversation
-before doing project work.
-
-Use exactly these conceptual states:
-
 ### ACTIVE
 
-Use ACTIVE when meaningful work is already progressing without needing the user,
-including a currently running Codex turn or an autonomous background operation
-that is still making progress.
+Work is already progressing.
 
-Action:
-
-1. Do not start duplicate work.
-2. Do not restart commands, tests, builds, agents, or processes that are already running.
-3. Leave WAKE enabled.
-4. End this scheduled run quietly and concisely.
+- Do not duplicate work.
+- Do not restart running commands, tests, builds, agents, or processes.
+- Leave watcher registration in `monitoring`.
 
 ### WAITING_USER
 
-Use WAITING_USER when progress requires something only the user can provide or do,
-including:
+Progress requires the user to answer, approve, provide information/credentials,
+restart something, perform a manual step, or confirm an external action.
 
-- answering a question
-- choosing between alternatives
-- granting approval or permission
-- providing credentials or other missing information
-- completing a manual action
-- restarting an application, service, machine, process tree, or environment
-- confirming that an external/manual step has completed
-- responding to an explicit "waiting for you" request from the previous turn
+Before ending the turn, pause the exact registration:
 
-Action:
+Windows:
 
-1. PAUSE or DISABLE the current conversation's WAKE scheduled task immediately.
-2. Do not continue the project task.
-3. Do not create another retry task.
-4. Do not keep sending periodic "still waiting" messages.
-5. Emit at most one concise status message explaining what user action is awaited
-   and that WAKE has been paused.
-6. Preserve all existing work and state.
+`"$HOME\.codex\skills\wake\scripts\pause-current.cmd" --reason "<short reason>"`
 
-This state is the key anti-noise rule. A conversation waiting for the user must
-not be "shaken awake" every quarter hour.
+macOS/Linux:
+
+`"$HOME/.codex/skills/wake/scripts/pause-current.sh" --reason "<short reason>"`
+
+Then:
+
+- pause/disable fallback Scheduled Task when possible
+- do not create retry tasks
+- do not send periodic waiting messages
+- preserve all existing work
+- emit at most one concise message explaining what is awaited
+
+A `waiting_user` entry must never be woken by quota recovery.
+
+### QUOTA_BLOCKED
+
+The local watcher handles quota without needing a model turn at the moment of exhaustion.
+
+1. A thread registered by `$wake` starts in `monitoring`.
+2. The watcher independently reads `account/rateLimits/read`.
+3. When `ordinaryUsageAllowed == false`, `monitoring` becomes `quota_waiting`.
+4. `resetsAt` may schedule the next check, but is never proof of recovery.
+5. Only `ordinaryUsageAllowed == true` permits resume.
+6. Resume only exact `quota_waiting` thread ids.
+7. After a launch, return the registration to `monitoring`.
+8. The resumed turn must classify state again before doing work.
+
+If the watcher or exact registration is unavailable, use conservative Scheduled
+Task fallback on the quarter-hour grid.
+
+WAKE must never bypass or evade platform limits.
 
 ### RETRYABLE_BLOCKED
 
-Use RETRYABLE_BLOCKED only for temporary failures that do not require user action,
-including:
+For transient non-quota network/service/model failures:
 
-- usage limit reached
-- quota temporarily exhausted
-- rate limit
-- temporary service or model unavailability
-- transient network failure
-
-Action:
-
-1. Preserve all valid work.
-2. Keep WAKE enabled.
-3. Do not create additional retry schedules.
-4. Let the next synchronized quarter-hour run try again.
-
-WAKE must never attempt to bypass, evade, or defeat service limits.
+- preserve valid work
+- use synchronized Scheduled Task fallback
+- do not create extra retry schedules
 
 ### RUNNABLE
 
-Use RUNNABLE when the original task is unfinished, no other work is already
-progressing, and no user action is required.
+If unfinished work can continue without user input:
 
-Action:
-
-1. Inspect the current conversation and identify the original unfinished task.
-2. Inspect current files, code, worktree, configuration, runtime state, and
-   relevant tests before modifying anything.
-3. Preserve valid completed work.
-4. Determine what remains unfinished.
-5. Continue from the current state.
-6. Do not restart the task from scratch.
-7. Do not repeat completed steps unnecessarily.
-8. Do not create another conversation.
-9. Do not create another WAKE schedule.
-10. Continue autonomously as far as reasonably possible.
+- inspect current conversation, files, worktree, runtime state, and tests
+- preserve completed work
+- continue only unfinished work
+- do not restart from scratch
+- do not create duplicate schedules or registrations
 
 ### DONE
 
-Use DONE only after verifying the original request is fully complete.
+After verifying the original request is complete:
 
-Before classifying DONE:
+- report the result
+- stop/remove fallback Scheduled Task
+- unregister the exact thread
 
-1. Review the original request and later scope changes.
-2. Check the current project state.
-3. Run appropriate tests or checks when applicable.
-4. Verify that no requested work remains unfinished.
+Windows:
 
-Action:
+`"$HOME\.codex\skills\wake\scripts\unregister-current.cmd"`
 
-1. Report the final result normally.
-2. Disable, cancel, or remove this conversation's WAKE scheduled task.
-3. Do not continue waking after completion.
+macOS/Linux:
+
+`"$HOME/.codex/skills/wake/scripts/unregister-current.sh"`
 
 ### UNKNOWN
 
-If it is genuinely unclear whether the task can continue without the user:
+If user dependency is unclear:
 
-1. Do not guess and do not repeatedly retry.
-2. Ask one concise clarifying question.
-3. Treat the conversation as WAITING_USER.
-4. Pause WAKE until the user responds.
+- ask one concise question
+- treat as WAITING_USER
+- pause watcher registration and fallback task
 
 ## RE-ARM AFTER USER INPUT
 
-WAKE may be invoked implicitly only for this re-arm flow.
+If the user resolves a previous WAITING_USER blocker, re-enable exact monitoring:
 
-When the user sends a new message that clearly resolves the reason a WAKE-enabled
-conversation was paused, for example:
+Windows:
 
-- "已经重启好了"
-- "批准"
-- "选第二个"
-- "凭据已经配置好了"
-- "继续"
+`"$HOME\.codex\skills\wake\scripts\resume-current.cmd"`
 
-then:
+macOS/Linux:
 
-1. Check whether this CURRENT conversation has a WAKE task paused because it was
-   WAITING_USER.
-2. If not, do not create WAKE implicitly.
-3. If yes, determine whether the new user message actually resolves the blocker.
-4. If the blocker is resolved and the original task remains unfinished, re-enable
-   the existing WAKE task on the synchronized quarter-hour grid.
-5. Continue the user's current turn normally.
-6. Do not create a duplicate scheduled task.
+`"$HOME/.codex/skills/wake/scripts/resume-current.sh"`
 
-If implicit invocation does not occur on a host/version, the user can always
-re-arm explicitly with `$wake` or `$wake start`.
+If implicit invocation does not happen, `$wake` is the manual re-arm.
 
-## SCHEDULED WAKE PROMPT REQUIREMENTS
+## WATCHER COMMANDS
 
-When creating or updating the in-conversation scheduled task, ensure its prompt
-contains these semantics:
+Installed watcher:
 
-- Return to this same conversation.
-- Classify state BEFORE continuing work.
-- WAITING_USER => pause this WAKE task and stop.
-- ACTIVE => do not duplicate work.
-- RETRYABLE_BLOCKED => keep WAKE enabled for the next quarter-hour.
-- RUNNABLE => continue unfinished work from current state.
-- DONE => remove this WAKE task.
-- Never restart completed work from scratch.
+`~/.codex/skills/wake/watcher/wake_watcher.py`
 
-## STOP
+Useful commands:
 
-When `$wake stop` is invoked:
+- `doctor` — verify Codex CLI/App Server quota integration
+- `quota` — read quota once
+- `status` — watcher process and registration counts
+- `list` — list exact-thread registrations
+- `register-current` — register current `CODEX_THREAD_ID`
+- `pause-current` — mark current thread WAITING_USER
+- `resume-current` — return current thread to monitoring
+- `unregister-current` — remove current registration
 
-1. Find the WAKE scheduled task associated with THIS conversation.
-2. Disable, pause, cancel, or remove that scheduled task.
-3. Do not affect WAKE tasks belonging to other conversations.
-4. Do not alter project files merely because WAKE is being stopped.
-5. Confirm that automatic continuation for this conversation is no longer active.
+The watcher never stores OpenAI credentials, never redeems credits, never infers
+recovery from `resetsAt` alone, never uses `--last`, and never wakes
+`waiting_user` entries.
 
-## STATUS
-
-When `$wake status` is invoked, report:
-
-- enabled, paused, or stopped
-- current state if determinable: ACTIVE / WAITING_USER / RETRYABLE_BLOCKED /
-  RUNNABLE / DONE / UNKNOWN
-- pause reason, if paused
-- synchronized schedule: HH:00 / HH:15 / HH:30 / HH:45
-- next scheduled wake, if available
-- whether the original task appears complete or unfinished
-
-Do not create, delete, or change schedules while reporting status.
-
-## SAFETY AND IDEMPOTENCY
-
-WAKE controls continuation scheduling only.
-
-It must never:
-
-- intentionally bypass usage or quota limits
-- create rapid retry loops
-- create duplicate scheduled tasks for the same conversation
-- wake more frequently than the defined quarter-hour grid
-- modify schedules belonging to other conversations
-- start a new thread for scheduled continuation
-- discard valid user work merely to recreate state
-- keep periodic wakeups running while explicit user input is required
-
-Treat `$wake start` as idempotent whenever possible: repeated starts for the
-same conversation should still result in exactly one WAKE schedule.
+Watcher-driven resume currently uses exact detached `codex exec resume <thread-id>`.
+Codex Desktop UI synchronization may vary by version, so Scheduled Task fallback
+remains available.
