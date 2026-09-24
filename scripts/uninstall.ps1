@@ -1,8 +1,15 @@
-$ErrorActionPreference = "Stop"
+param(
+    [string]$TargetRoot = "$HOME\.codex\skills"
+)
 
-$Target = Join-Path $HOME ".agents\skills\wake"
+$ErrorActionPreference = "Stop"
+$Target = Join-Path $TargetRoot "wake"
 
 if (Test-Path $Target) {
+    $Stop = Join-Path $Target "scripts\stop-watcher.ps1"
+    if (Test-Path $Stop) {
+        powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Stop | Out-Null
+    }
     Remove-Item -Recurse -Force $Target
     Write-Host "WAKE removed from:"
     Write-Host "  $Target"
@@ -10,5 +17,3 @@ if (Test-Path $Target) {
     Write-Host "WAKE is not installed at:"
     Write-Host "  $Target"
 }
-
-Write-Host "Restart Codex if the skill still appears in the skill picker."
