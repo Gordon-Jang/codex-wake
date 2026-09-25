@@ -1,199 +1,165 @@
 ---
 name: wake
 description: >
-  Manage state-aware continuation for the current Codex conversation. Prefer the
-  local quota watcher when installed: register the exact current Codex thread via
-  CODEX_THREAD_ID, monitor account quota locally, and wake the thread when ordinary
-  usage becomes available again. Fall back to synchronized Scheduled Tasks when
-  exact-thread registration or the watcher is unavailable. Explicitly invoke with
-  $wake, $wake start, $wake stop, or $wake status. Re-arm implicitly only when the
-  user resolves a blocker in a conversation already using WAKE.
+  Checkpoint-first continuation for long Codex work across quota windows. Persist the
+  current task as a durable WAKE job with a compact checkpoint. When ordinary included
+  usage returns, continue the job in a new lightweight Codex exec thread instead of
+  resuming the old chat. Explicit commands: $wake, $wake start, $wake stop, $wake status.
 ---
 
-# WAKE
+# WAKE v0.4.0
 
-WAKE keeps long Codex work moving without blindly retrying quota every 15 minutes.
+WAKE persists the TASK, not the chat thread.
 
-## Backends
+## Core rule
 
-### Local quota watcher
+Never use `codex exec resume`, `--last`, recency, title, or another heuristic to
+reopen the old conversation. The old conversation is an archive. The durable object is
+the WAKE job and its checkpoint.
 
-Preferred for quota exhaustion:
+## $wake / $wake start
 
-- register the exact current thread from `CODEX_THREAD_ID`
-- read limits locally through `codex app-server`
-- use `ordinaryUsageAllowed` as the recovery authority
-- use `resetsAt` only as a hint for when to check again
-- resume only exact registered threads that observed quota blocking
-- never use `--last` and never guess a thread id
+For the CURRENT Codex conversation only:
 
-### Scheduled Task fallback
-
-Use the synchronized quarter-hour grid only when the watcher cannot safely handle
-the thread, or for non-quota transient failures:
-
-`RRULE:FREQ=HOURLY;BYMINUTE=0,15,30,45;BYSECOND=0`
-
-## Commands
-
-- `$wake` — same as `$wake start`
-- `$wake start` — enable or re-arm WAKE
-- `$wake stop` — unregister/stop WAKE for this conversation
-- `$wake status` — report backend and state without modifying it
-
-## START
-
-When `$wake` or `$wake start` is invoked:
-
-1. Operate on the CURRENT conversation only.
-2. Do not create or infer another thread.
-3. Start the local watcher if installed and not already running.
-4. From a shell/tool execution inside THIS conversation, register the exact current thread.
+1. Start the local watcher if it is not running.
 
 Windows:
-
-`"$HOME\.codex\skills\wake\scripts\register-current.cmd"`
-
-macOS/Linux:
-
-`"$HOME/.codex/skills/wake/scripts/register-current.sh"`
-
-The helper must obtain the id from `CODEX_THREAD_ID`. Never substitute recency,
-title, project path, ordering, or `--last`.
-
-5. If exact registration succeeds, prefer the watcher for quota recovery.
-6. Use at most one synchronized Scheduled Task as fallback when useful.
-
-## STATE MACHINE
-
-### ACTIVE
-
-Work is already progressing.
-
-- Do not duplicate work.
-- Do not restart running commands, tests, builds, agents, or processes.
-- Leave watcher registration in `monitoring`.
-
-### WAITING_USER
-
-Progress requires the user to answer, approve, provide information/credentials,
-restart something, perform a manual step, or confirm an external action.
-
-Before ending the turn, pause the exact registration:
-
-Windows:
-
-`"$HOME\.codex\skills\wake\scripts\pause-current.cmd" --reason "<short reason>"`
+`"$HOME\.codex\skills\wake\scripts\start-watcher.cmd"`
 
 macOS/Linux:
+`"$HOME/.codex/skills/wake/scripts/start-watcher.sh"`
 
-`"$HOME/.codex/skills/wake/scripts/pause-current.sh" --reason "<short reason>"`
+2. Define one concise task Goal from the user's actual request.
+3. From a shell/tool inside THIS conversation, create the job:
 
-Then:
+Windows example:
+`python "$HOME\.codex\skills\wake\watcher\wake_watcher.py" job-create-current --cwd "<workspace>" --goal "<goal>"`
 
-- pause/disable fallback Scheduled Task when possible
-- do not create retry tasks
-- do not send periodic waiting messages
-- preserve all existing work
-- emit at most one concise message explaining what is awaited
+The helper MUST obtain the source thread from `CODEX_THREAD_ID`; never guess it.
+If the thread already has a non-completed WAKE job, the helper returns that existing job
+with `alreadyExists: true` instead of creating a duplicate.
+4. Read the returned `checkpointPath` and refresh it into a compact,
+authoritative checkpoint containing:
 
-A `waiting_user` entry must never be woken by quota recovery.
+- Goal
+- Constraints
+- Completed
+- Decisions
+- Files changed
+- Verification
+- Current state
+- Next actions
+- Do not repeat
+- Blockers
+- Handoff
 
-### QUOTA_BLOCKED
+Keep it concise. Prefer a few KB; do not dump chat history.
+5. Arm the job only after Goal and Next actions are real:
 
-The local watcher handles quota without needing a model turn at the moment of exhaustion.
+`python "$HOME\.codex\skills\wake\watcher\wake_watcher.py" job-arm --job-id <job-id>`
 
-1. A thread registered by `$wake` starts in `monitoring`.
-2. The watcher independently reads `account/rateLimits/read`.
-3. When `ordinaryUsageAllowed == false`, `monitoring` becomes `quota_waiting`.
-4. `resetsAt` may schedule the next check, but is never proof of recovery.
-5. Only `ordinaryUsageAllowed == true` permits resume.
-6. Resume only exact `quota_waiting` thread ids.
-7. After a launch, return the registration to `monitoring`.
-8. The resumed turn must classify state again before doing work.
+6. Continue the task normally.
 
-If the watcher or exact registration is unavailable, use conservative Scheduled
-Task fallback on the quarter-hour grid.
+## Checkpoint discipline
 
-WAKE must never bypass or evade platform limits.
+While a WAKE job is active:
 
-### RETRYABLE_BLOCKED
+- update the checkpoint after every meaningful milestone;
+- update it before long-running, risky, or quota-heavy operations;
+- preserve verified work and explicit user constraints;
+- record abandoned approaches under Decisions / Do not repeat;
+- do not copy large logs, diffs, or chat transcripts into the checkpoint;
+- use paths, short results, commit ids, and test summaries instead.
 
-For transient non-quota network/service/model failures:
+The checkpoint is the recovery authority after a quota handoff.
 
-- preserve valid work
-- use synchronized Scheduled Task fallback
-- do not create extra retry schedules
+## Quota behavior
 
-### RUNNABLE
+The watcher keeps one hidden persistent local `codex app-server` only for
+`account/rateLimits/read`.
 
-If unfinished work can continue without user input:
+- `ordinaryUsageAllowed == false`: active jobs become `quota_waiting`.
+- `resetsAt` is only a check-time hint.
+- only `ordinaryUsageAllowed == true` permits a handoff.
+- recovery starts a NEW `codex exec` thread with the checkpoint path.
+- transient capacity/network failures use bounded exponential backoff (`retry_waiting`) instead of immediately giving up or spinning.
+- the recovery prompt explicitly forbids reconstructing or resuming the old chat.
 
-- inspect current conversation, files, worktree, runtime state, and tests
-- preserve completed work
-- continue only unfinished work
-- do not restart from scratch
-- do not create duplicate schedules or registrations
+This avoids Desktop active-writer conflicts and reduces repeated context processing.
 
-### DONE
+## New-thread handoff
 
-After verifying the original request is complete:
+The continuation thread must:
 
-- report the result
-- stop/remove fallback Scheduled Task
-- unregister the exact thread
+1. read the checkpoint first;
+2. inspect only minimal live workspace state, normally `git status --short` and
+   `git diff --stat`;
+3. continue from Next actions;
+4. not redo items listed under Completed or Do not repeat unless stale;
+5. keep updating the checkpoint;
+6. mark WAITING_USER or DONE with the helper commands below.
 
-Windows:
+WAKE does not bypass, evade, or increase platform quota.
 
-`"$HOME\.codex\skills\wake\scripts\unregister-current.cmd"`
+## WAITING_USER
 
-macOS/Linux:
+If progress requires an answer, approval, credential, restart, or manual action:
 
-`"$HOME/.codex/skills/wake/scripts/unregister-current.sh"`
+1. update the checkpoint with the exact blocker;
+2. run:
 
-### UNKNOWN
+`python "$HOME\.codex\skills\wake\watcher\wake_watcher.py" job-pause --job-id <job-id> --reason "<short reason>"`
 
-If user dependency is unclear:
+A `waiting_user` job is never auto-launched.
 
-- ask one concise question
-- treat as WAITING_USER
-- pause watcher registration and fallback task
+After the user resolves the blocker:
 
-## RE-ARM AFTER USER INPUT
+`python "$HOME\.codex\skills\wake\watcher\wake_watcher.py" job-rearm --job-id <job-id>`
 
-If the user resolves a previous WAITING_USER blocker, re-enable exact monitoring:
+## DONE
 
-Windows:
+After the original Goal is fully verified:
 
-`"$HOME\.codex\skills\wake\scripts\resume-current.cmd"`
+1. update the checkpoint with final verification;
+2. run:
 
-macOS/Linux:
+`python "$HOME\.codex\skills\wake\watcher\wake_watcher.py" job-complete --job-id <job-id>`
 
-`"$HOME/.codex/skills/wake/scripts/resume-current.sh"`
+Completed jobs remain as local history and are ignored by the watcher.
 
-If implicit invocation does not happen, `$wake` is the manual re-arm.
+## $wake status
 
-## WATCHER COMMANDS
+Report both watcher status and the current thread's active WAKE job without changing state:
 
-Installed watcher:
+`python "$HOME\.codex\skills\wake\watcher\wake_watcher.py" status`
 
-`~/.codex/skills/wake/watcher/wake_watcher.py`
+`python "$HOME\.codex\skills\wake\watcher\wake_watcher.py" job-current`
 
-Useful commands:
+If no active job is associated with the current thread, say so plainly.
 
-- `doctor` — verify Codex CLI/App Server quota integration
-- `quota` — read quota once
-- `status` — watcher process and registration counts
-- `list` — list exact-thread registrations
-- `register-current` — register current `CODEX_THREAD_ID`
-- `pause-current` — mark current thread WAITING_USER
-- `resume-current` — return current thread to monitoring
-- `unregister-current` — remove current registration
+## $wake stop
 
-The watcher never stores OpenAI credentials, never redeems credits, never infers
-recovery from `resetsAt` alone, never uses `--last`, and never wakes
-`waiting_user` entries.
+Stop automatic continuation for the current task without deleting its checkpoint:
 
-Watcher-driven resume currently uses exact detached `codex exec resume <thread-id>`.
-Codex Desktop UI synchronization may vary by version, so Scheduled Task fallback
-remains available.
+`python "$HOME\.codex\skills\wake\watcher\wake_watcher.py" job-stop-current`
+
+A `stopped` job is retained locally and is never auto-launched. A later `$wake start`
+may refresh its checkpoint and arm/rearm it again.
+
+## Diagnostics
+
+- `python ...\wake_watcher.py doctor`
+- `python ...\wake_watcher.py status`
+- `python ...\wake_watcher.py quota`
+- `python ...\wake_watcher.py job-list`
+- `python ...\wake_watcher.py job-status --job-id <id>`
+
+## Safety
+
+- Never resume the original thread automatically.
+- Never launch a job without a completed checkpoint.
+- Never auto-launch `waiting_user`, `needs_attention`, `stopped`, `completed`, or `draft`; only `quota_waiting` and due `retry_waiting` may launch a handoff.
+- Never infer quota recovery from time alone.
+- Never delete user work to recover a job.
+- If a continuation process exits while quota is available without marking DONE or
+  WAITING_USER, set `needs_attention` instead of looping.

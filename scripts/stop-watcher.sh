@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-SKILL_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-PIDFILE="$SKILL_ROOT/.state/watcher.pid"
+PIDFILE="$HOME/.codex/wake/watcher.pid"
 if [[ -f "$PIDFILE" ]]; then
   PID="$(cat "$PIDFILE")"
   kill "$PID" 2>/dev/null || true

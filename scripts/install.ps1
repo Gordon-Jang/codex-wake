@@ -4,63 +4,44 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-
 $RepoRoot = (Resolve-Path (Split-Path -Parent $PSScriptRoot)).Path
-$TargetRoot = [System.IO.Path]::GetFullPath($TargetRoot)
-$Target = Join-Path $TargetRoot "wake"
-
-if (-not (Test-Path (Join-Path $RepoRoot "SKILL.md"))) {
-    throw "SKILL.md not found at $RepoRoot"
-}
-
-New-Item -ItemType Directory -Force -Path $TargetRoot | Out-Null
-
+$Target = Join-Path ([System.IO.Path]::GetFullPath($TargetRoot)) "wake"
 $RepoFull = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd('\')
 $TargetFull = [System.IO.Path]::GetFullPath($Target).TrimEnd('\')
 
+New-Item -ItemType Directory -Force -Path $Target | Out-Null
+
 if ($RepoFull -ieq $TargetFull) {
-    Write-Host ""
-    Write-Host "WAKE is already located at the target path:"
-    Write-Host "  $Target"
-    Write-Host "No copy is needed."
+    Write-Host "WAKE is already at $Target"
 } else {
-    $SavedState = $null
-    $ExistingState = Join-Path $Target ".state"
-    if (Test-Path $ExistingState) {
-        $SavedState = Join-Path $env:TEMP ("wake-state-" + [guid]::NewGuid().ToString())
-        Copy-Item -Recurse -Force $ExistingState $SavedState
+    foreach ($File in @("SKILL.md","VERSION","README.md","README.zh-CN.md","CHANGELOG.md")) {
+        $Source = Join-Path $RepoRoot $File
+        if (Test-Path $Source) { Copy-Item -Force $Source $Target }
     }
-
-    if (Test-Path $Target) {
-        Remove-Item -Recurse -Force $Target
+    foreach ($Dir in @("agents","watcher","docs","scripts")) {
+        $SourceDir = Join-Path $RepoRoot $Dir
+        $DestDir = Join-Path $Target $Dir
+        New-Item -ItemType Directory -Force -Path $DestDir | Out-Null
+        Copy-Item -Recurse -Force (Join-Path $SourceDir "*") $DestDir
     }
-
-    New-Item -ItemType Directory -Force -Path $Target | Out-Null
-    Copy-Item -Force (Join-Path $RepoRoot "SKILL.md") $Target
-    Copy-Item -Force (Join-Path $RepoRoot "VERSION") $Target
-    Copy-Item -Recurse -Force (Join-Path $RepoRoot "agents") $Target
-    Copy-Item -Recurse -Force (Join-Path $RepoRoot "watcher") $Target
-    Copy-Item -Recurse -Force (Join-Path $RepoRoot "docs") $Target
-    Copy-Item -Recurse -Force (Join-Path $RepoRoot "scripts") $Target
-
-    if ($SavedState -and (Test-Path $SavedState)) {
-        Copy-Item -Recurse -Force $SavedState (Join-Path $Target ".state")
-        Remove-Item -Recurse -Force $SavedState
+    foreach ($Old in @(
+        "scripts\register-current.cmd","scripts\register-current.sh",
+        "scripts\pause-current.cmd","scripts\pause-current.sh",
+        "scripts\resume-current.cmd","scripts\resume-current.sh",
+        "scripts\unregister-current.cmd","scripts\unregister-current.sh",
+        "docs\v0.3.3-local.md","docs\v0.3.3-local2.md","README.local.md"
+    )) {
+        Remove-Item -Force (Join-Path $Target $Old) -ErrorAction SilentlyContinue
     }
-
-    Write-Host ""
-    Write-Host "WAKE v0.3.2 installed:"
-    Write-Host "  $Target"
+    Remove-Item -Recurse -Force (Join-Path $Target ".state") -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force (Join-Path $Target "watcher\__pycache__") -ErrorAction SilentlyContinue
+    Write-Host "WAKE v0.4.0 installed to $Target"
 }
 
-Write-Host ""
-Write-Host "Check quota integration:"
-Write-Host "  python `"$Target\watcher\wake_watcher.py`" doctor"
-
+$WakeHome = Join-Path $HOME ".codex\wake"
+New-Item -ItemType Directory -Force -Path $WakeHome | Out-Null
+Write-Host "Durable jobs: $WakeHome"
+Write-Host "Doctor: python $Target\watcher\wake_watcher.py doctor"
 if ($StartWatcher) {
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Target "scripts\start-watcher.ps1")
-} else {
-    Write-Host ""
-    Write-Host "Start watcher with:"
-    Write-Host "  `"$Target\scripts\start-watcher.cmd`""
 }

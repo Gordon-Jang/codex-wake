@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""Local quota watcher for WAKE v0.3.
+"""WAKE v0.4.0: checkpoint-first, job-first Codex continuation.
 
-This helper does not store OpenAI credentials and does not make model turns when
-checking quota. It asks the locally installed Codex App Server for
-account/rateLimits/read and only launches an exact registered thread after
-ordinaryUsageAllowed becomes true.
-
-Thread resume is intentionally explicit and experimental for Codex Desktop
-sessions because host/UI synchronization can vary across Codex versions.
+WAKE does not resume or take ownership of an existing Desktop thread.
+It tracks a durable job, waits for ordinary included usage to return, then
+starts a NEW lightweight Codex exec thread that reads only the checkpoint.
 """
 
 from __future__ import annotations
@@ -15,52 +11,61 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.3.2"
+VERSION = "0.4.0"
 SKILL_ROOT = Path.home() / ".codex" / "skills" / "wake"
-STATE_DIR = SKILL_ROOT / ".state"
-REGISTRY_FILE = STATE_DIR / "registrations.json"
-PID_FILE = STATE_DIR / "watcher.pid"
-LOG_FILE = STATE_DIR / "watcher.log"
-
-DEFAULT_RECOVERY_PROMPT = (
-    "[WAKE quota recovery] Included Codex usage is available again. "
-    "Return to this exact conversation and classify state before acting: "
-    "if WAITING_USER, pause WAKE; if ACTIVE, do not duplicate work; "
-    "if DONE, stop WAKE; otherwise continue only the unfinished task."
-)
-
+WAKE_HOME = Path.home() / ".codex" / "wake"
+JOBS_DIR = WAKE_HOME / "jobs"
+PID_FILE = WAKE_HOME / "watcher.pid"
+LOG_FILE = WAKE_HOME / "watcher.log"
 THREAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
+JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{5,95}$")
 _STOP = False
+MAX_TRANSIENT_RETRIES = 8
+RETRY_BASE_SECONDS = 60
+RETRY_MAX_SECONDS = 900
+REASONING_EFFORTS = {"low", "medium", "high", "xhigh", "ultra", "persistent", "max"}
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
-def utc_now() -> int:
+class WakeError(RuntimeError):
+    pass
+
+
+def now() -> int:
     return int(time.time())
 
 
 def iso(ts: int | None) -> str | None:
-    if ts is None:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
 
 
-def ensure_state_dir() -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+def ensure_dirs() -> None:
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def atomic_json(path: Path, obj: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
 def log(message: str) -> None:
-    ensure_state_dir()
-    stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-    line = f"[{stamp}] {message}"
+    ensure_dirs()
+    line = f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] {message}"
     print(line, flush=True)
     try:
         with LOG_FILE.open("a", encoding="utf-8") as f:
@@ -69,366 +74,264 @@ def log(message: str) -> None:
         pass
 
 
-def load_registry() -> dict[str, dict[str, Any]]:
-    ensure_state_dir()
-    if not REGISTRY_FILE.exists():
-        return {}
-    try:
-        data = json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    entries = data.get("registrations", {})
-    return entries if isinstance(entries, dict) else {}
-
-
-def save_registry(entries: dict[str, dict[str, Any]]) -> None:
-    ensure_state_dir()
-    tmp = REGISTRY_FILE.with_suffix(".tmp")
-    payload = {
-        "version": VERSION,
-        "updatedAt": utc_now(),
-        "registrations": entries,
-    }
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(REGISTRY_FILE)
+def hidden_creationflags() -> int:
+    if os.name != "nt":
+        return 0
+    return int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
 def find_codex() -> str:
-    codex = shutil.which("codex")
-    if not codex:
-        raise RuntimeError("codex executable was not found in PATH")
-    return codex
+    value = shutil.which("codex")
+    if not value:
+        raise WakeError("codex executable was not found in PATH")
+    return value
 
 
-def app_server_commands(codex: str) -> list[list[str]]:
-    return [
-        [codex, "app-server"],
-        [codex, "app-server", "--stdio"],
-    ]
+def validate_thread_id(value: str) -> str:
+    if not THREAD_ID_RE.match(value):
+        raise WakeError("unsafe thread id")
+    return value
 
 
-def _stderr_reader(stream: Any, sink: list[str]) -> None:
-    try:
-        for line in stream:
-            sink.append(line.rstrip())
-            if len(sink) > 200:
-                del sink[:100]
-    except Exception:
-        pass
-
-
-def _stdout_reader(stream: Any, out_queue: Any) -> None:
-    try:
-        for line in stream:
-            out_queue.put(line)
-    except Exception as exc:
-        out_queue.put(exc)
-    finally:
-        out_queue.put(None)
-
-
-def _send_json(proc: subprocess.Popen[str], message: dict[str, Any]) -> None:
-    if proc.stdin is None:
-        raise RuntimeError("app-server stdin is unavailable")
-    proc.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
-    proc.stdin.flush()
-
-
-def _wait_for_response(out_queue: Any, request_id: int, timeout: float) -> dict[str, Any]:
-    import queue
-
-    deadline = time.time() + timeout
-    while True:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            raise RuntimeError(f"timed out waiting for app-server response id={request_id}")
-        try:
-            item = out_queue.get(timeout=remaining)
-        except queue.Empty:
-            raise RuntimeError(f"timed out waiting for app-server response id={request_id}")
-        if item is None:
-            raise RuntimeError("app-server stdout closed before the requested response")
-        if isinstance(item, Exception):
-            raise RuntimeError(f"app-server stdout reader failed: {item}")
-        line = str(item).strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if obj.get("id") != request_id:
-            continue
-        if "error" in obj:
-            raise RuntimeError(f"app-server error: {obj['error']}")
-        result = obj.get("result")
-        if not isinstance(result, dict):
-            raise RuntimeError("app-server returned a non-object result")
-        return result
-
-
-def read_rate_limits(timeout: int = 30) -> dict[str, Any]:
-    import queue
-    import threading
-
-    codex = find_codex()
-    last_error: str | None = None
-
-    for cmd in app_server_commands(codex):
-        proc: subprocess.Popen[str] | None = None
-        stderr_lines: list[str] = []
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-            )
-            assert proc.stdout is not None
-            assert proc.stderr is not None
-
-            out_queue: queue.Queue[Any] = queue.Queue()
-            threading.Thread(target=_stdout_reader, args=(proc.stdout, out_queue), daemon=True).start()
-            threading.Thread(target=_stderr_reader, args=(proc.stderr, stderr_lines), daemon=True).start()
-
-            init_id = 1
-            quota_id = 7
-            _send_json(
-                proc,
-                {
-                    "method": "initialize",
-                    "id": init_id,
-                    "params": {
-                        "clientInfo": {
-                            "name": "codex-wake-watcher",
-                            "title": "Codex WAKE Watcher",
-                            "version": VERSION,
-                        }
-                    },
-                },
-            )
-            _wait_for_response(out_queue, init_id, timeout=min(timeout, 15))
-            _send_json(proc, {"method": "initialized", "params": {}})
-            _send_json(proc, {"method": "account/rateLimits/read", "id": quota_id})
-            return _wait_for_response(out_queue, quota_id, timeout=timeout)
-        except Exception as exc:
-            detail = "\n".join(stderr_lines[-20:]).strip()
-            last_error = f"{exc}; stderr={detail}" if detail else str(exc)
-        finally:
-            if proc is not None:
-                try:
-                    if proc.stdin:
-                        proc.stdin.close()
-                except Exception:
-                    pass
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-
-    raise RuntimeError(last_error or "unable to query Codex rate limits")
-
-
-def collect_reset_times(value: Any, out: set[int]) -> None:
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if key == "resetsAt" and isinstance(item, int):
-                out.add(item)
-            else:
-                collect_reset_times(item, out)
-    elif isinstance(value, list):
-        for item in value:
-            collect_reset_times(item, out)
-
-
-def summarize_quota(result: dict[str, Any]) -> dict[str, Any]:
-    ordinary = result.get("ordinaryUsageAllowed")
-    if ordinary not in (True, False, None):
-        ordinary = None
-
-    resets: set[int] = set()
-    collect_reset_times(result.get("rateLimits"), resets)
-    collect_reset_times(result.get("rateLimitsByLimitId"), resets)
-
-    now = utc_now()
-    future = sorted(ts for ts in resets if ts > now - 2)
-    return {
-        "ordinaryUsageAllowed": ordinary,
-        "accountPresent": bool(result.get("accountId")),
-        "nextResetAt": future[0] if future else None,
-        "nextResetAtUtc": iso(future[0]) if future else None,
-        "allResetTimes": future,
-        "rateLimits": result.get("rateLimits"),
-        "rateLimitsByLimitId": result.get("rateLimitsByLimitId"),
-    }
-
-
-def validate_thread_id(thread_id: str) -> None:
-    if not THREAD_ID_RE.match(thread_id):
-        raise SystemExit(
-            "Refusing unsafe thread id. Supply the exact Codex thread/session id; "
-            "WAKE never guesses or uses --last."
-        )
+def validate_job_id(value: str) -> str:
+    if not JOB_ID_RE.match(value):
+        raise WakeError("unsafe job id")
+    return value
 
 
 def current_thread_id(required: bool = True) -> str | None:
     value = os.environ.get("CODEX_THREAD_ID", "").strip()
     if not value:
         if required:
-            raise SystemExit(
-                "CODEX_THREAD_ID is not present. Run this command from a shell/tool "
-                "invoked by the target Codex conversation, not from a normal terminal."
-            )
+            raise WakeError("CODEX_THREAD_ID is unavailable; run inside the target Codex conversation")
         return None
-    validate_thread_id(value)
-    return value
+    return validate_thread_id(value)
 
 
-def normalize_cwd(cwd: str | None) -> Path:
-    path = Path(cwd or os.getcwd()).expanduser().resolve()
-    if not path.exists() or not path.is_dir():
-        raise SystemExit(f"cwd does not exist or is not a directory: {path}")
-    return path
+def new_job_id() -> str:
+    return f"wake-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
 
 
-def register_thread(thread_id: str, cwd: str | None, prompt: str) -> dict[str, Any]:
+def job_dir(job_id: str) -> Path:
+    return JOBS_DIR / validate_job_id(job_id)
+
+
+def state_path(job_id: str) -> Path:
+    return job_dir(job_id) / "state.json"
+
+
+def checkpoint_path(job_id: str) -> Path:
+    return job_dir(job_id) / "checkpoint.md"
+
+
+def run_dir(job_id: str) -> Path:
+    return job_dir(job_id) / "runs"
+
+
+def load_job(job_id: str) -> dict[str, Any]:
+    path = state_path(job_id)
+    if not path.exists():
+        raise WakeError(f"job not found: {job_id}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise WakeError(f"invalid job state: {job_id}")
+    return data
+
+
+def save_job(job: dict[str, Any]) -> None:
+    job["updatedAt"] = now()
+    atomic_json(state_path(str(job["jobId"])), job)
+
+
+def all_jobs() -> list[dict[str, Any]]:
+    ensure_dirs()
+    jobs: list[dict[str, Any]] = []
+    for path in sorted(JOBS_DIR.glob("*/state.json")):
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(obj, dict):
+                jobs.append(obj)
+        except Exception:
+            continue
+    return jobs
+
+
+def find_job_for_thread(thread_id: str) -> dict[str, Any] | None:
     validate_thread_id(thread_id)
-    path = normalize_cwd(cwd)
-    entries = load_registry()
-    now = utc_now()
-    old = entries.get(thread_id, {})
-    entry = {
-        "threadId": thread_id,
-        "cwd": str(path),
-        "prompt": prompt,
-        "state": "monitoring",
-        "registeredAt": old.get("registeredAt") or now,
-        "updatedAt": now,
-        "quotaBlockedObservedAt": old.get("quotaBlockedObservedAt"),
-        "lastLaunchAt": old.get("lastLaunchAt"),
-        "launchLog": old.get("launchLog"),
+    matches = [
+        job for job in all_jobs()
+        if job.get("state") != "completed"
+        and thread_id in {job.get("originalThreadId"), job.get("currentThreadId")}
+    ]
+    if not matches:
+        return None
+    matches.sort(key=lambda x: int(x.get("updatedAt") or 0), reverse=True)
+    return matches[0]
+
+
+CHECKPOINT_TEMPLATE = """# WAKE Task Checkpoint
+
+## Goal
+REPLACE_ME
+
+## Constraints
+- Preserve completed work.
+- Do not reconstruct or reread the old chat unless this checkpoint explicitly requires it.
+
+## Completed
+- None recorded yet.
+
+## Decisions
+- None recorded yet.
+
+## Files changed
+- None recorded yet.
+
+## Verification
+- None recorded yet.
+
+## Current state
+Checkpoint created; fill this before arming WAKE.
+
+## Next actions
+1. REPLACE_ME
+
+## Do not repeat
+- Do not redo completed investigation without evidence it is stale.
+
+## Blockers
+- None.
+
+## Handoff
+Update this file after every meaningful milestone and before long-running work.
+"""
+
+
+def create_job(
+    thread_id: str,
+    cwd: str | None,
+    goal: str | None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+) -> dict[str, Any]:
+    validate_thread_id(thread_id)
+    if model is not None:
+        model = model.strip()
+        if not MODEL_RE.match(model):
+            raise WakeError("unsafe model name")
+    if reasoning_effort is not None:
+        reasoning_effort = reasoning_effort.strip().lower()
+        if reasoning_effort not in REASONING_EFFORTS:
+            raise WakeError(f"unsupported reasoning effort: {reasoning_effort}")
+    existing = find_job_for_thread(thread_id)
+    if existing is not None:
+        result = dict(existing)
+        result["alreadyExists"] = True
+        return result
+    root = Path(cwd or os.getcwd()).expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        raise WakeError(f"cwd does not exist: {root}")
+    jid = new_job_id()
+    jdir = job_dir(jid)
+    jdir.mkdir(parents=True, exist_ok=False)
+    run_dir(jid).mkdir()
+    cp = CHECKPOINT_TEMPLATE
+    if goal:
+        cp = cp.replace("## Goal\nREPLACE_ME", f"## Goal\n{goal.strip()}", 1)
+    checkpoint_path(jid).write_text(cp, encoding="utf-8")
+    job = {
+        "version": VERSION,
+        "jobId": jid,
+        "originalThreadId": thread_id,
+        "currentThreadId": thread_id,
+        "cwd": str(root),
+        "checkpointPath": str(checkpoint_path(jid)),
+        "state": "draft",
+        "checkpointReady": False,
+        "generation": 0,
+        "model": model,
+        "reasoningEffort": reasoning_effort,
+        "retryCount": 0,
+        "nextRetryAt": None,
+        "createdAt": now(),
+        "updatedAt": now(),
         "lastError": None,
         "pauseReason": None,
+        "lastRunPid": None,
+        "lastRunLog": None,
     }
-    entries[thread_id] = entry
-    save_registry(entries)
-    return entry
+    save_job(job)
+    return job
 
 
-def register_current(cwd: str | None, prompt: str) -> None:
-    thread_id = current_thread_id(required=True)
-    assert thread_id is not None
-    print(json.dumps(register_thread(thread_id, cwd, prompt), ensure_ascii=False, indent=2))
+def arm_job(job_id: str) -> dict[str, Any]:
+    job = load_job(job_id)
+    cp_path = checkpoint_path(job_id)
+    text = cp_path.read_text(encoding="utf-8")
+    if "## Goal\nREPLACE_ME" in text or "1. REPLACE_ME" in text:
+        raise WakeError("checkpoint still contains REPLACE_ME; fill Goal and Next actions first")
+    if cp_path.stat().st_size > 65536:
+        raise WakeError("checkpoint exceeds 64 KiB; compact it before arming")
+    job["checkpointReady"] = True
+    job["state"] = "monitoring"
+    job["lastError"] = None
+    save_job(job)
+    return job
 
 
-def pause_thread(thread_id: str, reason: str) -> None:
-    validate_thread_id(thread_id)
-    entries = load_registry()
-    entry = entries.get(thread_id)
-    if not entry:
-        raise SystemExit("thread is not registered with WAKE")
-    entry["state"] = "waiting_user"
-    entry["pauseReason"] = reason or "waiting for user"
-    entry["updatedAt"] = utc_now()
-    entries[thread_id] = entry
-    save_registry(entries)
-    print(json.dumps(entry, ensure_ascii=False, indent=2))
+def pause_job(job_id: str, reason: str) -> dict[str, Any]:
+    job = load_job(job_id)
+    job["state"] = "waiting_user"
+    job["pauseReason"] = reason.strip() or "waiting for user"
+    save_job(job)
+    return job
 
 
-def pause_current(reason: str) -> None:
-    thread_id = current_thread_id(required=True)
-    assert thread_id is not None
-    pause_thread(thread_id, reason)
+def rearm_job(job_id: str) -> dict[str, Any]:
+    job = load_job(job_id)
+    if job.get("state") == "completed":
+        raise WakeError("completed jobs are immutable; create a new job instead")
+    if not job.get("checkpointReady"):
+        raise WakeError("job checkpoint is not armed")
+    job["state"] = "monitoring"
+    job["pauseReason"] = None
+    job["lastError"] = None
+    save_job(job)
+    return job
 
 
-def resume_thread(thread_id: str, cwd: str | None = None) -> None:
-    validate_thread_id(thread_id)
-    entries = load_registry()
-    entry = entries.get(thread_id)
-    if not entry:
-        entry = register_thread(thread_id, cwd, DEFAULT_RECOVERY_PROMPT)
-    else:
-        if cwd:
-            entry["cwd"] = str(normalize_cwd(cwd))
-        entry["state"] = "monitoring"
-        entry["pauseReason"] = None
-        entry["updatedAt"] = utc_now()
-        entry["lastError"] = None
-        entries[thread_id] = entry
-        save_registry(entries)
-    print(json.dumps(entry, ensure_ascii=False, indent=2))
+def stop_job(job_id: str) -> dict[str, Any]:
+    job = load_job(job_id)
+    if job.get("state") == "completed":
+        return job
+    job["state"] = "stopped"
+    job["pauseReason"] = "stopped by user"
+    job["lastRunPid"] = None
+    save_job(job)
+    return job
 
 
-def resume_current(cwd: str | None = None) -> None:
-    thread_id = current_thread_id(required=True)
-    assert thread_id is not None
-    resume_thread(thread_id, cwd)
+def complete_job(job_id: str) -> dict[str, Any]:
+    job = load_job(job_id)
+    job["state"] = "completed"
+    job["completedAt"] = now()
+    job["lastRunPid"] = None
+    save_job(job)
+    return job
 
 
-def unregister(thread_id: str) -> None:
-    validate_thread_id(thread_id)
-    entries = load_registry()
-    existed = entries.pop(thread_id, None)
-    save_registry(entries)
-    print("unregistered" if existed else "not registered")
-
-
-def unregister_current() -> None:
-    thread_id = current_thread_id(required=True)
-    assert thread_id is not None
-    unregister(thread_id)
-
-
-def show_current() -> None:
-    thread_id = current_thread_id(required=True)
-    assert thread_id is not None
-    entry = load_registry().get(thread_id)
-    print(json.dumps({"threadId": thread_id, "registration": entry}, ensure_ascii=False, indent=2))
-
-
-def arm_quota(thread_id: str, cwd: str, prompt: str) -> None:
-    entry = register_thread(thread_id, cwd, prompt)
-    entries = load_registry()
-    entry["state"] = "quota_waiting"
-    entry["quotaBlockedObservedAt"] = utc_now()
-    entry["updatedAt"] = utc_now()
-    entries[thread_id] = entry
-    save_registry(entries)
-    print(json.dumps(entry, ensure_ascii=False, indent=2))
-
-
-def disarm(thread_id: str) -> None:
-    unregister(thread_id)
-
-
-def list_regs() -> None:
-    print(json.dumps(load_registry(), ensure_ascii=False, indent=2))
-
-
-def is_process_alive(pid: int) -> bool:
-    if pid <= 0:
+def is_process_alive(pid: int | None) -> bool:
+    if not pid or pid <= 0:
         return False
     if os.name == "nt":
         try:
-            completed = subprocess.run(
+            cp = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=5,
-                check=False,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, timeout=5, check=False,
+                creationflags=hidden_creationflags(),
             )
-            return str(pid) in completed.stdout
+            return str(pid) in cp.stdout
         except Exception:
             return False
     try:
@@ -438,150 +341,445 @@ def is_process_alive(pid: int) -> bool:
         return False
 
 
+class StdioAppServer:
+    """Persistent hidden app-server used only for account/rateLimits/read."""
+
+    def __init__(self) -> None:
+        self.proc: subprocess.Popen[str] | None = None
+        self.out: queue.Queue[Any] = queue.Queue()
+        self.stderr: list[str] = []
+        self.next_id = 1
+        self.lock = threading.RLock()
+
+    def start(self) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            return
+        self.close()
+        self.out = queue.Queue()
+        self.stderr = []
+        kwargs: dict[str, Any] = {
+            "stdin": subprocess.PIPE, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
+            "text": True, "encoding": "utf-8", "errors": "replace", "bufsize": 1,
+        }
+        flags = hidden_creationflags()
+        if flags:
+            kwargs["creationflags"] = flags
+        self.proc = subprocess.Popen([find_codex(), "app-server"], **kwargs)
+        assert self.proc.stdout is not None and self.proc.stderr is not None
+        threading.Thread(target=self._read_stdout, daemon=True).start()
+        threading.Thread(target=self._read_stderr, daemon=True).start()
+        self.request("initialize", {"clientInfo": {
+            "name": "codex-wake-watcher", "title": "Codex WAKE Watcher", "version": VERSION,
+        }}, timeout=15, skip_start=True)
+        self.notify("initialized", {}, skip_start=True)
+
+    def _read_stdout(self) -> None:
+        assert self.proc is not None and self.proc.stdout is not None
+        try:
+            for line in self.proc.stdout:
+                self.out.put(line)
+        except Exception as exc:
+            self.out.put(exc)
+        finally:
+            self.out.put(None)
+
+    def _read_stderr(self) -> None:
+        assert self.proc is not None and self.proc.stderr is not None
+        try:
+            for line in self.proc.stderr:
+                self.stderr.append(line.rstrip())
+                self.stderr[:] = self.stderr[-200:]
+        except Exception:
+            pass
+
+    def _send(self, obj: dict[str, Any]) -> None:
+        if self.proc is None or self.proc.stdin is None or self.proc.poll() is not None:
+            raise WakeError("app-server is not running")
+        self.proc.stdin.write(json.dumps(obj, separators=(",", ":")) + "\n")
+        self.proc.stdin.flush()
+
+    def notify(self, method: str, params: dict[str, Any] | None = None, *, skip_start: bool = False) -> None:
+        if not skip_start:
+            self.start()
+        obj: dict[str, Any] = {"method": method}
+        if params is not None:
+            obj["params"] = params
+        self._send(obj)
+
+    def request(self, method: str, params: dict[str, Any] | None = None, *,
+                timeout: float = 30, skip_start: bool = False) -> dict[str, Any]:
+        with self.lock:
+            if not skip_start:
+                self.start()
+            req_id = self.next_id
+            self.next_id += 1
+            obj: dict[str, Any] = {"method": method, "id": req_id}
+            if params is not None:
+                obj["params"] = params
+            self._send(obj)
+            deadline = time.time() + timeout
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise WakeError(f"timed out waiting for {method}")
+                try:
+                    item = self.out.get(timeout=remaining)
+                except queue.Empty as exc:
+                    raise WakeError(f"timed out waiting for {method}") from exc
+                if item is None:
+                    raise WakeError("app-server stdout closed; " + " | ".join(self.stderr[-10:]))
+                if isinstance(item, Exception):
+                    raise WakeError(str(item))
+                try:
+                    msg = json.loads(str(item).strip())
+                except json.JSONDecodeError:
+                    continue
+                if msg.get("id") != req_id:
+                    continue
+                if "error" in msg:
+                    raise WakeError(f"{method} failed: {msg['error']}")
+                result = msg.get("result")
+                if not isinstance(result, dict):
+                    raise WakeError(f"{method} returned non-object result")
+                return result
+
+    def close(self) -> None:
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def summarize_quota(raw: dict[str, Any]) -> dict[str, Any]:
+    ordinary = raw.get("ordinaryUsageAllowed")
+    limits = raw.get("rateLimits")
+    if not isinstance(limits, dict):
+        limits = {}
+    times: list[int] = []
+    for key in ("primary", "secondary"):
+        item = limits.get(key)
+        if isinstance(item, dict) and isinstance(item.get("resetsAt"), int):
+            times.append(int(item["resetsAt"]))
+    future = sorted(x for x in times if x > now())
+    next_reset = future[0] if future else (min(times) if times else None)
+    return {
+        "ordinaryUsageAllowed": ordinary if isinstance(ordinary, bool) else None,
+        "accountPresent": bool(raw.get("accountId")),
+        "nextResetAt": next_reset,
+        "nextResetAtUtc": iso(next_reset),
+        "allResetTimes": sorted(set(times)),
+        "rateLimits": limits,
+    }
+
+
+def next_sleep(summary: dict[str, Any]) -> int:
+    if summary.get("ordinaryUsageAllowed") is False:
+        reset = summary.get("nextResetAt")
+        if isinstance(reset, int):
+            return min(max(5, reset - now() + 2), 300)
+        return 300
+    return 60
+
+
+def continuation_prompt(job: dict[str, Any]) -> str:
+    jid = str(job["jobId"])
+    cp = str(job["checkpointPath"])
+    cwd = str(job["cwd"])
+    helper = str(SKILL_ROOT / "watcher" / "wake_watcher.py")
+    return f"""Continue WAKE job {jid}. This is a checkpoint handoff, not a chat resume.
+
+Read FIRST and treat as authoritative:
+{cp}
+
+Then inspect only the minimum live workspace state needed in:
+{cwd}
+
+If that directory is inside a Git worktree, normally inspect:
+- git status --short
+- git diff --stat
+If it is not a Git worktree, skip Git checks without treating that as an error.
+
+Do NOT reconstruct, resume, or reread the previous chat/thread. Do NOT repeat work listed
+under Completed or Do not repeat unless verification is demonstrably stale.
+
+Continue from Next actions and work toward the Goal. Update the checkpoint after every
+meaningful milestone and before long-running or risky operations. Keep it concise.
+
+If user input/manual action is required, update the checkpoint, then run:
+python "{helper}" job-pause --job-id {jid} --reason "<short reason>"
+
+When the Goal is fully verified complete, update the checkpoint, then run:
+python "{helper}" job-complete --job-id {jid}
+
+If usage quota stops execution, exit normally; WAKE will create the next checkpoint handoff.
+"""
+
+
+def launch_handoff(job: dict[str, Any]) -> dict[str, Any]:
+    jid = str(job["jobId"])
+    source_state = str(job.get("state") or "")
+    cwd = Path(str(job["cwd"]))
+    if not cwd.exists():
+        raise WakeError(f"cwd no longer exists: {cwd}")
+    jdir = job_dir(jid)
+    run_dir(jid).mkdir(parents=True, exist_ok=True)
+    generation = int(job.get("generation") or 0) + 1
+    log_path = run_dir(jid) / f"run-{generation:04d}-{now()}.jsonl"
+    stream = log_path.open("a", encoding="utf-8")
+    cmd = [
+        find_codex(), "exec", "--json", "--color", "never",
+        "--sandbox", "workspace-write", "--skip-git-repo-check",
+        "-C", str(cwd), "--add-dir", str(jdir),
+    ]
+    model = job.get("model")
+    if isinstance(model, str) and model:
+        cmd.extend(["-m", model])
+    effort = job.get("reasoningEffort")
+    if isinstance(effort, str) and effort:
+        cmd.extend(["-c", f'model_reasoning_effort="{effort}"'])
+    cmd.append(continuation_prompt(job))
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL, "stdout": stream, "stderr": subprocess.STDOUT,
+        "cwd": str(cwd),
+    }
+    flags = hidden_creationflags()
+    if flags:
+        kwargs["creationflags"] = flags
+    proc = subprocess.Popen(cmd, **kwargs)
+    stream.close()
+    job["generation"] = generation
+    job["state"] = "running"
+    if source_state == "quota_waiting":
+        job["retryCount"] = 0
+    job["nextRetryAt"] = None
+    job["currentThreadId"] = None
+    job["lastRunPid"] = proc.pid
+    job["lastRunLog"] = str(log_path)
+    job["lastRunStartedAt"] = now()
+    job["lastError"] = None
+    save_job(job)
+    log(f"job {jid} launched checkpoint handoff generation={generation} pid={proc.pid}")
+    return job
+
+
+def discover_run_thread(job: dict[str, Any]) -> dict[str, Any]:
+    path_value = job.get("lastRunLog")
+    if not path_value:
+        return job
+    path = Path(str(path_value))
+    if not path.exists():
+        return job
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for index, line in enumerate(f):
+                if index >= 80:
+                    break
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "thread.started":
+                    tid = event.get("thread_id") or event.get("threadId")
+                    if isinstance(tid, str) and THREAD_ID_RE.match(tid):
+                        if job.get("currentThreadId") != tid:
+                            job["currentThreadId"] = tid
+                            save_job(job)
+                        break
+    except OSError:
+        pass
+    return job
+
+
+def classify_run_failure(job: dict[str, Any]) -> tuple[bool, str]:
+    path_value = job.get("lastRunLog")
+    if not path_value:
+        return False, "continuation exited without a run log"
+    path = Path(str(path_value))
+    if not path.exists():
+        return False, "continuation run log is missing"
+
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            if size > 131072:
+                f.seek(size - 131072)
+            text = f.read().decode("utf-8", errors="replace")
+    except OSError as exc:
+        return False, f"could not read run log: {exc}"
+
+    messages: list[str] = []
+    for line in text.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "turn.failed":
+            err = event.get("error")
+            if isinstance(err, dict) and isinstance(err.get("message"), str):
+                messages.append(err["message"])
+        elif event.get("type") == "error" and isinstance(event.get("message"), str):
+            messages.append(event["message"])
+        elif event.get("type") == "item.completed":
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") == "error" and isinstance(item.get("message"), str):
+                messages.append(item["message"])
+
+    reason = messages[-1] if messages else "continuation exited without marking job complete or waiting_user"
+    haystack = ("\n".join(messages) + "\n" + text[-32768:]).lower()
+    retryable_patterns = (
+        "selected model is at capacity",
+        "request timed out",
+        "timed out",
+        "temporarily unavailable",
+        "service unavailable",
+        "connection reset",
+        "connection error",
+        "connection closed",
+        "network error",
+        "reconnecting",
+        "bad gateway",
+        "gateway timeout",
+        "http 502",
+        "http 503",
+        "http 504",
+    )
+    return any(pattern in haystack for pattern in retryable_patterns), reason
+
+
+def reconcile_running(job: dict[str, Any], ordinary: bool | None) -> None:
+    jid = str(job["jobId"])
+    fresh = load_job(jid)
+    if fresh.get("state") != "running":
+        return
+    job = discover_run_thread(fresh)
+    pid = job.get("lastRunPid")
+    if is_process_alive(int(pid) if isinstance(pid, int) else None):
+        return
+    if ordinary is False:
+        job["state"] = "quota_waiting"
+        job["quotaBlockedObservedAt"] = now()
+        job["retryCount"] = 0
+        job["nextRetryAt"] = None
+        job["lastRunPid"] = None
+        save_job(job)
+        log(f"job {jid} run ended while quota blocked; waiting for next window")
+        return
+
+    retryable, reason = classify_run_failure(job)
+    if ordinary is True and retryable:
+        retry_count = int(job.get("retryCount") or 0) + 1
+        if retry_count <= MAX_TRANSIENT_RETRIES:
+            delay = min(RETRY_BASE_SECONDS * (2 ** (retry_count - 1)), RETRY_MAX_SECONDS)
+            job["state"] = "retry_waiting"
+            job["retryCount"] = retry_count
+            job["nextRetryAt"] = now() + delay
+            job["lastRunPid"] = None
+            job["lastError"] = reason
+            save_job(job)
+            log(f"job {jid} transient failure; retry {retry_count}/{MAX_TRANSIENT_RETRIES} in {delay}s: {reason}")
+            return
+        reason = f"transient retry limit exceeded ({MAX_TRANSIENT_RETRIES}): {reason}"
+
+    job["state"] = "needs_attention"
+    job["lastRunPid"] = None
+    job["nextRetryAt"] = None
+    job["lastError"] = reason
+    save_job(job)
+    log(f"job {jid} needs attention: {reason}")
+
+
+def process_once(app: StdioAppServer) -> int:
+    jobs = [j for j in all_jobs() if j.get("checkpointReady") and j.get("state") not in {"completed", "draft", "stopped"}]
+    if not jobs:
+        return 60
+    try:
+        summary = summarize_quota(app.request("account/rateLimits/read"))
+    except Exception as exc:
+        log(f"quota read failed: {exc}")
+        app.close()
+        return 60
+    ordinary = summary.get("ordinaryUsageAllowed")
+    log(f"quota ordinaryUsageAllowed={ordinary} nextResetAt={summary.get('nextResetAtUtc')} jobs={len(jobs)}")
+
+    for job in jobs:
+        jid = str(job["jobId"])
+        try:
+            job = load_job(jid)
+        except Exception:
+            continue
+        state = str(job.get("state"))
+        if state in {"completed", "draft", "stopped", "waiting_user", "needs_attention"}:
+            continue
+        if state == "running":
+            reconcile_running(job, ordinary)
+            continue
+        if ordinary is False:
+            if state != "quota_waiting":
+                job["state"] = "quota_waiting"
+                job["quotaBlockedObservedAt"] = now()
+                job["retryCount"] = 0
+                job["nextRetryAt"] = None
+                job["lastError"] = None
+                save_job(job)
+                log(f"job {jid} entered quota_waiting")
+            continue
+        if ordinary is True and state in {"quota_waiting", "retry_waiting"}:
+            if state == "retry_waiting":
+                retry_at = job.get("nextRetryAt")
+                if isinstance(retry_at, int) and now() < retry_at:
+                    continue
+            try:
+                latest = load_job(jid)
+                if latest.get("state") not in {"quota_waiting", "retry_waiting"}:
+                    continue
+                retry_at = latest.get("nextRetryAt")
+                if latest.get("state") == "retry_waiting" and isinstance(retry_at, int) and now() < retry_at:
+                    continue
+                launch_handoff(latest)
+            except Exception as exc:
+                latest = load_job(jid)
+                if latest.get("state") in {"quota_waiting", "retry_waiting"}:
+                    latest["state"] = "needs_attention"
+                    latest["lastError"] = str(exc)
+                    latest["nextRetryAt"] = None
+                    save_job(latest)
+                    log(f"job {jid} handoff launch failed: {exc}")
+    return next_sleep(summary)
+
 def watcher_status() -> dict[str, Any]:
     pid: int | None = None
     if PID_FILE.exists():
         try:
             pid = int(PID_FILE.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
+        except Exception:
             pid = None
-    entries = load_registry()
+    jobs = all_jobs()
     counts: dict[str, int] = {}
-    for entry in entries.values():
-        state = str(entry.get("state") or "unknown")
-        counts[state] = counts.get(state, 0) + 1
+    for job in jobs:
+        key = str(job.get("state") or "unknown")
+        counts[key] = counts.get(key, 0) + 1
     return {
+        "version": VERSION,
         "pid": pid,
-        "running": bool(pid and is_process_alive(pid)),
-        "registry": str(REGISTRY_FILE),
-        "log": str(LOG_FILE),
-        "registeredCount": len(entries),
+        "running": is_process_alive(pid),
+        "wakeHome": str(WAKE_HOME),
+        "jobsDir": str(JOBS_DIR),
+        "jobCount": len(jobs),
         "stateCounts": counts,
         "currentThreadEnvPresent": bool(os.environ.get("CODEX_THREAD_ID")),
     }
-
-
-def safe_name(thread_id: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]", "_", thread_id)[:80]
-
-
-def launch_resume(entry: dict[str, Any]) -> tuple[bool, str]:
-    thread_id = str(entry["threadId"])
-    validate_thread_id(thread_id)
-    cwd = Path(str(entry["cwd"]))
-    prompt = str(entry.get("prompt") or DEFAULT_RECOVERY_PROMPT)
-    if not cwd.exists():
-        return False, f"cwd no longer exists: {cwd}"
-
-    codex = find_codex()
-    ensure_state_dir()
-    log_path = STATE_DIR / f"resume-{safe_name(thread_id)}-{utc_now()}.log"
-    stream = log_path.open("a", encoding="utf-8")
-    cmd = [
-        codex,
-        "exec",
-        "resume",
-        thread_id,
-        "--json",
-        "--skip-git-repo-check",
-        prompt,
-    ]
-
-    kwargs: dict[str, Any] = {
-        "cwd": str(cwd),
-        "stdin": subprocess.DEVNULL,
-        "stdout": stream,
-        "stderr": subprocess.STDOUT,
-        "close_fds": os.name != "nt",
-    }
-    if os.name == "nt":
-        creationflags = 0
-        creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
-        kwargs["creationflags"] = creationflags
-
-    try:
-        subprocess.Popen(cmd, **kwargs)
-    except OSError as exc:
-        stream.close()
-        return False, str(exc)
-    stream.close()
-    return True, str(log_path)
-
-
-def next_sleep_seconds(summary: dict[str, Any]) -> int:
-    ordinary = summary.get("ordinaryUsageAllowed")
-    if ordinary is None:
-        return 60
-    next_reset = summary.get("nextResetAt")
-    if ordinary is False and isinstance(next_reset, int):
-        until = max(5, next_reset - utc_now() + 2)
-        return min(until, 300)
-    return 60
-
-
-def process_once() -> int:
-    entries = load_registry()
-    tracked = {
-        k: v for k, v in entries.items()
-        if v.get("state") in {"monitoring", "quota_waiting"}
-    }
-    if not tracked:
-        return 30
-
-    try:
-        summary = summarize_quota(read_rate_limits())
-    except Exception as exc:
-        log(f"quota read failed: {exc}")
-        return 60
-
-    ordinary = summary.get("ordinaryUsageAllowed")
-    waiting = sum(1 for v in tracked.values() if v.get("state") == "quota_waiting")
-    log(
-        "quota: ordinaryUsageAllowed="
-        f"{ordinary} nextResetAt={summary.get('nextResetAtUtc')} "
-        f"tracked={len(tracked)} quota_waiting={waiting}"
-    )
-
-    changed = False
-    if ordinary is False:
-        now = utc_now()
-        for thread_id, entry in tracked.items():
-            if entry.get("state") == "monitoring":
-                entry["state"] = "quota_waiting"
-                entry["quotaBlockedObservedAt"] = now
-                entry["updatedAt"] = now
-                entries[thread_id] = entry
-                changed = True
-                log(f"thread {thread_id} entered quota_waiting")
-        if changed:
-            save_registry(entries)
-        return next_sleep_seconds(summary)
-
-    if ordinary is not True:
-        return next_sleep_seconds(summary)
-
-    for thread_id, entry in list(entries.items()):
-        if entry.get("state") != "quota_waiting":
-            continue
-        ok, detail = launch_resume(entry)
-        if ok:
-            entry["state"] = "monitoring"
-            entry["lastLaunchAt"] = utc_now()
-            entry["launchLog"] = detail
-            entry["lastError"] = None
-            entry["updatedAt"] = utc_now()
-            log(f"quota recovered; launched exact thread {thread_id}; log={detail}")
-        else:
-            entry["lastError"] = detail
-            entry["updatedAt"] = utc_now()
-            log(f"failed to launch exact thread {thread_id}: {detail}")
-        entries[thread_id] = entry
-        changed = True
-
-    if changed:
-        save_registry(entries)
-    return 30
 
 
 def handle_stop(_signum: int, _frame: Any) -> None:
@@ -590,19 +788,21 @@ def handle_stop(_signum: int, _frame: Any) -> None:
 
 
 def run_daemon() -> None:
-    ensure_state_dir()
+    ensure_dirs()
     PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
     signal.signal(signal.SIGINT, handle_stop)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, handle_stop)
+    app = StdioAppServer()
     log(f"WAKE watcher {VERSION} started pid={os.getpid()}")
     try:
         while not _STOP:
-            delay = process_once()
-            end = time.time() + max(1, delay)
+            delay = max(1, process_once(app))
+            end = time.time() + delay
             while not _STOP and time.time() < end:
                 time.sleep(min(1, end - time.time()))
     finally:
+        app.close()
         try:
             if PID_FILE.exists() and PID_FILE.read_text(encoding="utf-8").strip() == str(os.getpid()):
                 PID_FILE.unlink()
@@ -616,129 +816,116 @@ def doctor() -> int:
         "version": VERSION,
         "python": sys.executable,
         "codex": shutil.which("codex"),
+        "windowsNoWindow": bool(hidden_creationflags()) if os.name == "nt" else None,
         "watcher": watcher_status(),
     }
+    app = StdioAppServer()
     try:
-        result["quota"] = summarize_quota(read_rate_limits())
+        result["quota"] = summarize_quota(app.request("account/rateLimits/read"))
         result["quotaReadOk"] = True
     except Exception as exc:
         result["quotaReadOk"] = False
         result["quotaError"] = str(exc)
+    finally:
+        app.close()
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if result["quotaReadOk"] else 1
+    return 0 if result.get("quotaReadOk") else 1
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="WAKE local quota watcher")
-    p.add_argument("--version", action="version", version=VERSION)
-    sub = p.add_subparsers(dest="command", required=True)
+def current_job(required: bool = True) -> dict[str, Any] | None:
+    tid = current_thread_id(required)
+    if tid is None:
+        return None
+    job = find_job_for_thread(tid)
+    if job is None and required:
+        raise WakeError(f"no active WAKE job is associated with thread {tid}")
+    return job
 
-    sub.add_parser("quota", help="Read Codex rate limits once")
-    sub.add_parser("run", help="Run the watcher loop in the foreground")
-    sub.add_parser("once", help="Process registrations once")
-    sub.add_parser("list", help="List exact-thread registrations")
-    sub.add_parser("status", help="Show watcher process/registry status")
-    sub.add_parser("doctor", help="Check Codex and quota-read integration")
 
-    register = sub.add_parser("register", help="Register one exact thread for quota monitoring")
-    register.add_argument("--thread-id", required=True)
-    register.add_argument("--cwd")
-    register.add_argument("--prompt", default=DEFAULT_RECOVERY_PROMPT)
-
-    register_current_p = sub.add_parser(
-        "register-current",
-        help="Register CODEX_THREAD_ID from the current Codex shell/tool environment",
-    )
-    register_current_p.add_argument("--cwd")
-    register_current_p.add_argument("--prompt", default=DEFAULT_RECOVERY_PROMPT)
-
-    pause = sub.add_parser("pause", help="Mark one exact thread WAITING_USER")
-    pause.add_argument("--thread-id", required=True)
-    pause.add_argument("--reason", default="waiting for user")
-
-    pause_current_p = sub.add_parser("pause-current", help="Mark current CODEX_THREAD_ID WAITING_USER")
-    pause_current_p.add_argument("--reason", default="waiting for user")
-
-    resume = sub.add_parser("resume-monitoring", help="Re-enable quota monitoring for one thread")
-    resume.add_argument("--thread-id", required=True)
-    resume.add_argument("--cwd")
-
-    resume_current_p = sub.add_parser(
-        "resume-current",
-        help="Re-enable monitoring for current CODEX_THREAD_ID",
-    )
-    resume_current_p.add_argument("--cwd")
-
-    unregister_p = sub.add_parser("unregister", help="Remove one exact thread registration")
-    unregister_p.add_argument("--thread-id", required=True)
-    sub.add_parser("unregister-current", help="Remove current CODEX_THREAD_ID registration")
-    sub.add_parser("current", help="Show registration for current CODEX_THREAD_ID")
-
-    arm = sub.add_parser("arm-quota", help="Immediately mark one exact thread quota-waiting")
-    arm.add_argument("--thread-id", required=True)
-    arm.add_argument("--cwd", required=True)
-    arm.add_argument("--prompt", default=DEFAULT_RECOVERY_PROMPT)
-
-    dis = sub.add_parser("disarm", help="Alias for unregister")
-    dis.add_argument("--thread-id", required=True)
-    return p
+def print_json(obj: Any) -> None:
+    print(json.dumps(obj, ensure_ascii=False, indent=2))
 
 
 def main() -> int:
-    args = build_parser().parse_args()
-    if args.command == "quota":
-        print(json.dumps(summarize_quota(read_rate_limits()), ensure_ascii=False, indent=2))
-        return 0
-    if args.command == "run":
-        run_daemon()
-        return 0
-    if args.command == "once":
-        delay = process_once()
-        print(json.dumps({"nextCheckSeconds": delay}, indent=2))
-        return 0
-    if args.command == "list":
-        list_regs()
-        return 0
-    if args.command == "status":
-        print(json.dumps(watcher_status(), ensure_ascii=False, indent=2))
-        return 0
-    if args.command == "doctor":
+    p = argparse.ArgumentParser(description="WAKE checkpoint-first job continuation")
+    p.add_argument("--version", action="version", version=VERSION)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name in (
+        "run", "once", "quota", "status", "doctor", "job-list",
+        "job-current", "job-stop-current", "job-rearm-current", "job-complete-current",
+    ):
+        sub.add_parser(name)
+
+    jc = sub.add_parser("job-create")
+    jc.add_argument("--thread-id", required=True)
+    jc.add_argument("--cwd")
+    jc.add_argument("--goal")
+    jc.add_argument("--model")
+    jc.add_argument("--reasoning-effort")
+    jcc = sub.add_parser("job-create-current")
+    jcc.add_argument("--cwd")
+    jcc.add_argument("--goal")
+    jcc.add_argument("--model")
+    jcc.add_argument("--reasoning-effort")
+    for name in ("job-arm", "job-status", "job-rearm", "job-stop", "job-complete"):
+        sp = sub.add_parser(name)
+        sp.add_argument("--job-id", required=True)
+    jp = sub.add_parser("job-pause")
+    jp.add_argument("--job-id", required=True)
+    jp.add_argument("--reason", default="waiting for user")
+    jpc = sub.add_parser("job-pause-current")
+    jpc.add_argument("--reason", default="waiting for user")
+    args = p.parse_args()
+
+    if args.cmd == "run":
+        run_daemon(); return 0
+    if args.cmd == "status":
+        print_json(watcher_status()); return 0
+    if args.cmd == "doctor":
         return doctor()
-    if args.command == "register":
-        print(json.dumps(register_thread(args.thread_id, args.cwd, args.prompt), ensure_ascii=False, indent=2))
-        return 0
-    if args.command == "register-current":
-        register_current(args.cwd, args.prompt)
-        return 0
-    if args.command == "pause":
-        pause_thread(args.thread_id, args.reason)
-        return 0
-    if args.command == "pause-current":
-        pause_current(args.reason)
-        return 0
-    if args.command == "resume-monitoring":
-        resume_thread(args.thread_id, args.cwd)
-        return 0
-    if args.command == "resume-current":
-        resume_current(args.cwd)
-        return 0
-    if args.command == "unregister":
-        unregister(args.thread_id)
-        return 0
-    if args.command == "unregister-current":
-        unregister_current()
-        return 0
-    if args.command == "current":
-        show_current()
-        return 0
-    if args.command == "arm-quota":
-        arm_quota(args.thread_id, args.cwd, args.prompt)
-        return 0
-    if args.command == "disarm":
-        disarm(args.thread_id)
-        return 0
+    if args.cmd == "job-list":
+        print_json(all_jobs()); return 0
+    if args.cmd == "job-current":
+        print_json(current_job(True)); return 0
+    if args.cmd == "job-create":
+        print_json(create_job(
+            args.thread_id, args.cwd, args.goal, args.model, args.reasoning_effort
+        )); return 0
+    if args.cmd == "job-create-current":
+        print_json(create_job(
+            current_thread_id(True), args.cwd, args.goal, args.model, args.reasoning_effort
+        )); return 0
+    if args.cmd == "job-arm":
+        print_json(arm_job(args.job_id)); return 0
+    if args.cmd == "job-status":
+        print_json(load_job(args.job_id)); return 0
+    if args.cmd == "job-rearm":
+        print_json(rearm_job(args.job_id)); return 0
+    if args.cmd == "job-stop":
+        print_json(stop_job(args.job_id)); return 0
+    if args.cmd == "job-pause":
+        print_json(pause_job(args.job_id, args.reason)); return 0
+    if args.cmd == "job-complete":
+        print_json(complete_job(args.job_id)); return 0
+    if args.cmd == "job-rearm-current":
+        print_json(rearm_job(str(current_job(True)["jobId"]))); return 0
+    if args.cmd == "job-stop-current":
+        print_json(stop_job(str(current_job(True)["jobId"]))); return 0
+    if args.cmd == "job-pause-current":
+        print_json(pause_job(str(current_job(True)["jobId"]), args.reason)); return 0
+    if args.cmd == "job-complete-current":
+        print_json(complete_job(str(current_job(True)["jobId"]))); return 0
+    app = StdioAppServer()
+    try:
+        if args.cmd == "quota":
+            print_json(summarize_quota(app.request("account/rateLimits/read"))); return 0
+        if args.cmd == "once":
+            print_json({"nextCheckSeconds": process_once(app)}); return 0
+    finally:
+        app.close()
     return 2
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

@@ -14,7 +14,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Validate WAKE metadata
+      - name: Validate metadata and checkpoint-first contract
         shell: python
         run: |
           from pathlib import Path
@@ -23,40 +23,41 @@ jobs:
           skill = Path("SKILL.md")
           agent = Path("agents/openai.yaml")
           watcher = Path("watcher/wake_watcher.py")
+          docs = Path("docs/quota-watcher.md")
 
-          assert skill.is_file()
-          assert agent.is_file()
-          assert watcher.is_file()
+          for path in (skill, agent, watcher, docs):
+              assert path.is_file(), f"Missing {path}"
 
           text = skill.read_text(encoding="utf-8")
+          agent_text = agent.read_text(encoding="utf-8")
+          watcher_text = watcher.read_text(encoding="utf-8")
+
           assert text.startswith("---\n")
           assert re.search(r"(?m)^name:\s*wake\s*$", text)
+          for required in (
+              "$wake", "$wake start", "$wake stop", "$wake status",
+              "checkpoint", "quota_waiting", "needs_attention",
+              "ordinaryUsageAllowed", "job-create-current", "job-complete",
+          ):
+              assert required in text, f"Missing SKILL contract: {required}"
 
-          required = [
-              "$wake",
-              "$wake start",
-              "$wake stop",
-              "$wake status",
-              "CODEX_THREAD_ID",
-              "ordinaryUsageAllowed",
-              "QUOTA_BLOCKED",
-              "WAITING_USER",
-              "BYMINUTE=0,15,30,45",
-          ]
-          for item in required:
-              assert item in text, f"Missing required content: {item}"
+          assert "codex exec resume" not in watcher_text
+          assert '"exec"' in watcher_text
+          assert "checkpoint.md" in watcher_text
+          assert re.search(
+              r"(?m)^\s*allow_implicit_invocation:\s*true\s*$",
+              agent_text,
+          )
 
-          version = Path("VERSION").read_text(encoding="utf-8").strip()
-          assert version in {"0.2.0", "0.3.2"}
-
-          watcher_text = watcher.read_text(encoding="utf-8")
-          assert 'VERSION = "0.3.2"' in watcher_text
-
-      - name: Compile watcher
-        run: python -m py_compile watcher/wake_watcher.py
+      - name: Run Python tests
+        run: |
+          python -m py_compile watcher/wake_watcher.py
+          python -m unittest discover -s tests -v
 
       - name: Check shell scripts
         run: |
-          for file in scripts/*.sh; do
-            bash -n "$file"
-          done
+          bash -n scripts/install.sh
+          bash -n scripts/uninstall.sh
+          bash -n scripts/start-watcher.sh
+          bash -n scripts/status-watcher.sh
+          bash -n scripts/stop-watcher.sh

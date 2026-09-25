@@ -1,9 +1,3 @@
-# Runtime state
-.state/
-*.log
-__pycache__/
-*.py[cod]
-
 # OS
 .DS_Store
 Thumbs.db
@@ -13,6 +7,10 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Python
+__pycache__/
+*.py[cod]
 
 # Temporary files
 *.tmp
