@@ -6,3 +6,4 @@ if [[ -x "$TARGET/scripts/stop-watcher.sh" ]]; then
 fi
 rm -rf "$TARGET"
 echo "WAKE removed: $TARGET"
+echo "Durable jobs preserved: $HOME/.codex/wake"

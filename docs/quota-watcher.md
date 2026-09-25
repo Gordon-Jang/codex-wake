@@ -1,48 +1,130 @@
-# Quota-aware watcher design — v0.3.2
+# Checkpoint-first quota watcher — v0.4
 
-The watcher is registered before quota is exhausted. This matters because a model
-turn may not be available at the exact moment the account hits its limit.
+## Goal
 
-## Exact thread identity
+Continue a long Codex task across included-usage windows without reopening the entire
+old conversation and without competing with Codex Desktop for the same thread writer.
 
-Codex shell/tool executions receive `CODEX_THREAD_ID`. `$wake start` invokes a
-local helper from the target conversation so the watcher records that exact id.
+The durable object is a **WAKE job**, not a Codex thread.
 
-A normal external terminal does not have this variable and therefore cannot use
-`register-current`. WAKE never substitutes `--last`, recency, title, or working
-directory for exact identity.
-
-## State transition
+## Persistent layout
 
 ```text
-$wake start
-    ↓
-monitoring
-    ↓ ordinaryUsageAllowed == false
-quota_waiting
-    ↓ ordinaryUsageAllowed == true
-resume exact thread once
-    ↓
+~/.codex/wake/
+├─ watcher.pid
+├─ watcher.log
+└─ jobs/
+   └─ <job-id>/
+      ├─ state.json
+      ├─ checkpoint.md
+      └─ runs/
+         └─ run-0001-<timestamp>.jsonl
+```
+
+The Skill install lives separately under `~/.codex/skills/wake`. Reinstalling the Skill
+therefore does not erase job/checkpoint history.
+
+## Initial registration
+
+`$wake` runs inside the source Codex conversation and requires `CODEX_THREAD_ID`.
+The thread id is recorded only as provenance. It is never used for automatic resume.
+
+The current model writes a compact checkpoint and then arms the job.
+
+```text
+draft
+  |
+  | checkpoint filled + job-arm
+  v
 monitoring
 ```
 
-A `waiting_user` entry is outside that transition and is not woken by quota recovery.
+A draft job is never launched.
 
 ## Quota authority
 
-The watcher calls `account/rateLimits/read` through local `codex app-server`.
+WAKE reads `account/rateLimits/read` from one hidden persistent local
+`codex app-server`.
 
-- `ordinaryUsageAllowed == true` → recovery is allowed
-- `ordinaryUsageAllowed == false` → keep waiting
-- `ordinaryUsageAllowed == null` → unknown; never assume recovery
-- `resetsAt` → check-time hint only
+- `ordinaryUsageAllowed == false` means wait.
+- `ordinaryUsageAllowed == true` permits a checkpoint handoff.
+- null/unknown means do not infer recovery.
+- `resetsAt` is only a scheduling hint.
 
-Multiple reset windows may exist. The earliest future reset is only a useful next
-check time; the watcher always re-reads `ordinaryUsageAllowed` before waking anything.
+Multiple windows can exist. WAKE always re-reads the authoritative boolean before launch.
 
-## Desktop limitation
+## State machine
 
-Recovery currently uses exact `codex exec resume <thread-id>`. Exact identity is
-safer than `--last`, but a detached CLI continuation may not always render in
-Codex Desktop exactly like a native Desktop turn. Keep Scheduled Task fallback
-available where detached resume is not satisfactory.
+```text
+monitoring
+   |
+   | ordinaryUsageAllowed == false
+   v
+quota_waiting
+   |
+   | ordinaryUsageAllowed == true
+   v
+running  -- starts NEW codex exec thread
+   |
+   +--> completed
+   |
+   +--> waiting_user
+   |
+   +--> quota_waiting      (run ended while quota blocked)
+   |
+   +--> retry_waiting      (temporary capacity/network failure)
+   |       |
+   |       +--> running    (bounded exponential backoff)
+   |
+   +--> needs_attention    (non-retryable failure / retry limit exceeded)
+```
+
+`waiting_user`, `needs_attention`, `stopped`, `draft`, and `completed` are not auto-launched.
+
+## Handoff contract
+
+Recovery uses a fresh:
+
+```text
+codex exec --json -C <workspace> --add-dir <job-dir> ...
+```
+
+It does **not** use `codex exec resume`.
+
+The continuation prompt requires the new thread to:
+
+1. read `checkpoint.md` first;
+2. normally inspect only `git status --short` and `git diff --stat`;
+3. continue from `Next actions`;
+4. skip work already listed under `Completed` or `Do not repeat`;
+5. update the checkpoint after meaningful milestones;
+6. call `job-pause` when user input is required;
+7. call `job-complete` after the Goal is fully verified.
+
+## Why not resume the old Desktop thread?
+
+In testing, detached `codex exec resume <thread-id>` failed with:
+
+```text
+thread-store conflict: thread ... already has an active writer
+```
+
+Codex Desktop already owned that thread. v0.4 avoids that control-plane conflict entirely
+by making a new thread for each quota handoff.
+
+## Failure handling
+
+WAKE distinguishes transient failures from terminal ones:
+
+- selected-model capacity and common temporary network/HTTP 502/503/504 failures enter `retry_waiting`;
+- retry delay grows exponentially from 60 seconds, is capped at 15 minutes, and stops after 8 retries;
+- if a continuation process exits while quota is available for a non-retryable reason, WAKE sets `needs_attention`;
+- if it exits while quota is unavailable, WAKE returns to `quota_waiting`;
+- missing workspace paths or launch errors also become `needs_attention`.
+
+## Context-efficiency rule
+
+The checkpoint should stay small and operational. Record conclusions, file paths, short
+verification results, and next actions. Do not paste old chat history, full logs, or large
+diffs. Old chats remain available as archives if a human later needs them.
+

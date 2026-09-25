@@ -1,7 +1,7 @@
 interface:
   display_name: "Wake"
-  short_description: "Quota-aware continuation for long Codex tasks with a local watcher and safe Scheduled Task fallback."
-  default_prompt: "Use $wake to keep this Codex conversation progressing. Prefer the local quota watcher only when an exact thread id is available; pause while waiting for the user; never guess a thread id or bypass usage limits."
+  short_description: "Checkpoint-first continuation for long Codex jobs across quota windows."
+  default_prompt: "Use $wake to persist the current task as a compact checkpoint-backed job. On quota recovery, continue in a new lightweight thread from the checkpoint instead of resuming the old chat."
 
 policy:
   allow_implicit_invocation: true
