@@ -12,8 +12,10 @@ spec.loader.exec_module(wake)
 
 
 class FakeApp:
-    def __init__(self, ordinary):
+    def __init__(self, ordinary, primary_percent=10, secondary_percent=20):
         self.ordinary = ordinary
+        self.primary_percent = primary_percent
+        self.secondary_percent = secondary_percent
 
     def request(self, method):
         assert method == "account/rateLimits/read"
@@ -21,8 +23,8 @@ class FakeApp:
             "ordinaryUsageAllowed": self.ordinary,
             "accountId": "x",
             "rateLimits": {
-                "primary": {"usedPercent": 10, "resetsAt": wake.now() + 60},
-                "secondary": {"usedPercent": 20, "resetsAt": wake.now() + 3600},
+                "primary": {"usedPercent": self.primary_percent, "resetsAt": wake.now() + 60},
+                "secondary": {"usedPercent": self.secondary_percent, "resetsAt": wake.now() + 3600},
             },
         }
 
@@ -58,6 +60,11 @@ class WakeTests(unittest.TestCase):
         self.assertEqual(job["state"], "draft")
         self.assertFalse(job["checkpointReady"])
         self.assertTrue(wake.checkpoint_path(job["jobId"]).exists())
+        self.assertTrue(wake.memory_path(job["jobId"]).exists())
+        self.assertEqual(job["memoryFormat"], wake.MEMORY_FORMAT)
+        self.assertEqual(job["contextPolicy"], "capsule_first")
+        self.assertEqual(job["historyPolicy"], "do_not_replay")
+        self.assertFalse(job["memoryReady"])
 
     def test_arm_rejects_placeholder(self):
         job = wake.create_job("thread-12345678", str(self.cwd), None)
@@ -67,6 +74,8 @@ class WakeTests(unittest.TestCase):
     def test_arm_pause_rearm_complete(self):
         job = self.create_ready_job()
         jid = job["jobId"]
+        self.assertTrue(job["memoryReady"])
+        self.assertLessEqual(job["memorySizeBytes"], wake.MEMORY_MAX_BYTES)
         self.assertEqual(wake.pause_job(jid, "need approval")["state"], "waiting_user")
         self.assertEqual(wake.rearm_job(jid)["state"], "monitoring")
         self.assertEqual(wake.complete_job(jid)["state"], "completed")
@@ -121,11 +130,17 @@ class WakeTests(unittest.TestCase):
             wake.process_once(FakeApp(False))
         self.assertEqual(wake.load_job(job["jobId"])["state"], "quota_waiting")
 
-    def test_prompt_is_checkpoint_first(self):
+    def test_prompt_is_memory_capsule_first(self):
         job = self.create_ready_job()
         prompt = wake.continuation_prompt(job)
+        self.assertIn(str(wake.state_path(job["jobId"])), prompt)
+        self.assertIn(str(wake.memory_path(job["jobId"])), prompt)
         self.assertIn(job["checkpointPath"], prompt)
-        self.assertIn("Do NOT reconstruct, resume, or reread", prompt)
+        self.assertLess(prompt.index(str(wake.memory_path(job["jobId"]))), prompt.index(job["checkpointPath"]))
+        self.assertIn("Do NOT reconstruct, resume, reread, or summarize", prompt)
+        self.assertIn("git rev-parse --is-inside-work-tree", prompt)
+        self.assertIn("Do not read SKILL.md just to recover this job", prompt)
+        self.assertIn("memory-refresh", prompt)
         self.assertIn("job-complete", prompt)
         self.assertIn("job-pause", prompt)
 
@@ -188,6 +203,87 @@ class WakeTests(unittest.TestCase):
         cmd = popen.call_args.args[0]
         self.assertIn("gpt-5.6-luna", cmd)
         self.assertIn('model_reasoning_effort="low"', cmd)
+
+    def test_memory_capsule_is_compact_task_state_not_transcript(self):
+        job = wake.create_job("thread-memory-12345678", str(self.cwd), "Preserve the task state")
+        cp = wake.checkpoint_path(job["jobId"])
+        text = cp.read_text(encoding="utf-8")
+        text = text.replace("1. REPLACE_ME", "1. Continue from the verified boundary")
+        text = text.replace("- None recorded yet.", "- VERIFIED_" + ("x" * 20000), 1)
+        cp.write_text(text, encoding="utf-8")
+        armed = wake.arm_job(job["jobId"])
+        capsule = wake.memory_path(job["jobId"]).read_text(encoding="utf-8")
+        self.assertTrue(capsule.startswith("# WAKE_MEMORY_CAPSULE_V1"))
+        self.assertIn("task-state serialization", capsule)
+        self.assertNotIn("# WAKE Task Checkpoint", capsule)
+        self.assertNotIn("VERIFIED_" + ("x" * 5000), capsule)
+        self.assertLessEqual(len(capsule.encode("utf-8")), wake.MEMORY_MAX_BYTES)
+        self.assertTrue(armed["memoryReady"])
+
+    def test_memory_refresh_tracks_checkpoint_changes(self):
+        job = self.create_ready_job()
+        jid = job["jobId"]
+        before = wake.load_job(jid)["memoryGeneration"]
+        cp = wake.checkpoint_path(jid)
+        text = cp.read_text(encoding="utf-8").replace(
+            "Checkpoint created; fill this before arming WAKE.",
+            "MEMORY_REFRESH_MARKER: implementation reached phase two.",
+        )
+        cp.write_text(text, encoding="utf-8")
+        status_before = wake.memory_status(jid)
+        self.assertTrue(status_before["checkpointNewerThanMemory"])
+        stale_job = wake.load_job(jid)
+        stale_job["version"] = "0.4.0"
+        wake.save_job(stale_job)
+        refreshed = wake.refresh_memory_from_checkpoint(wake.load_job(jid))
+        capsule = wake.memory_path(jid).read_text(encoding="utf-8")
+        self.assertIn("MEMORY_REFRESH_MARKER", capsule)
+        self.assertEqual(refreshed["version"], wake.VERSION)
+        self.assertGreater(refreshed["memoryGeneration"], before)
+        self.assertFalse(wake.memory_status(jid)["checkpointNewerThanMemory"])
+
+    def test_memory_refresh_migrates_metadata_even_when_capsule_is_fresh(self):
+        job = self.create_ready_job()
+        jid = job["jobId"]
+        stale = wake.load_job(jid)
+        stale["version"] = "0.4.0"
+        stale["contextPolicy"] = "legacy"
+        wake.save_job(stale)
+        refreshed = wake.refresh_memory_from_checkpoint(wake.load_job(jid))
+        self.assertEqual(refreshed["version"], wake.VERSION)
+        self.assertEqual(refreshed["contextPolicy"], "capsule_first")
+        self.assertEqual(refreshed["historyPolicy"], "do_not_replay")
+
+    def test_high_quota_pressure_seals_latest_memory_without_launching(self):
+        job = self.create_ready_job()
+        jid = job["jobId"]
+        with mock.patch.object(wake, "launch_handoff") as launch:
+            wake.process_once(FakeApp(True, primary_percent=92, secondary_percent=20))
+            launch.assert_not_called()
+        result = wake.load_job(jid)
+        self.assertEqual(result["state"], "monitoring")
+        self.assertEqual(result["memoryPressure"], "high")
+        self.assertIsNotNone(result["memorySealedAt"])
+        self.assertEqual(
+            result["memorySealedCheckpointMtimeNs"],
+            result["memoryCheckpointMtimeNs"],
+        )
+
+    def test_pause_refreshes_memory_before_waiting_user(self):
+        job = self.create_ready_job()
+        jid = job["jobId"]
+        cp = wake.checkpoint_path(jid)
+        cp.write_text(
+            cp.read_text(encoding="utf-8").replace(
+                "Checkpoint created; fill this before arming WAKE.",
+                "PAUSE_MEMORY_MARKER: waiting for a human decision.",
+            ),
+            encoding="utf-8",
+        )
+        paused = wake.pause_job(jid, "need approval")
+        self.assertEqual(paused["state"], "waiting_user")
+        capsule = wake.memory_path(jid).read_text(encoding="utf-8")
+        self.assertIn("PAUSE_MEMORY_MARKER", capsule)
 
     def test_summarize_quota_hides_account_id(self):
         future = wake.now() + 120

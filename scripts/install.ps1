@@ -35,7 +35,7 @@ if ($RepoFull -ieq $TargetFull) {
     }
     Remove-Item -Recurse -Force (Join-Path $Target ".state") -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force (Join-Path $Target "watcher\__pycache__") -ErrorAction SilentlyContinue
-    Write-Host "WAKE v0.4.0 installed to $Target"
+    Write-Host "WAKE v0.5.0 installed to $Target"
 }
 
 $WakeHome = Join-Path $HOME ".codex\wake"

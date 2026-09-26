@@ -16,6 +16,6 @@ if [[ "$REPO_ROOT" != "$TARGET" ]]; then
   cp -R "$REPO_ROOT/agents" "$REPO_ROOT/watcher" "$REPO_ROOT/docs" "$REPO_ROOT/scripts" "$TARGET/"
 fi
 mkdir -p "$HOME/.codex/wake"
-echo "WAKE v0.4.0 installed: $TARGET"
+echo "WAKE v0.5.0 installed: $TARGET"
 echo "Durable jobs: $HOME/.codex/wake"
 echo "Run: python3 '$TARGET/watcher/wake_watcher.py' doctor"

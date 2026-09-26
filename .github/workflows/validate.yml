@@ -36,14 +36,19 @@ jobs:
           assert re.search(r"(?m)^name:\s*wake\s*$", text)
           for required in (
               "$wake", "$wake start", "$wake stop", "$wake status",
-              "checkpoint", "quota_waiting", "needs_attention",
+              "checkpoint", "memory-capsule.md", "WAKE_MEMORY_CAPSULE_V1",
+              "capsule_first", "do_not_replay", "quota_waiting", "needs_attention",
               "ordinaryUsageAllowed", "job-create-current", "job-complete",
+              "memory-refresh", "memory-status",
           ):
               assert required in text, f"Missing SKILL contract: {required}"
 
           assert "codex exec resume" not in watcher_text
           assert '"exec"' in watcher_text
           assert "checkpoint.md" in watcher_text
+          assert "memory-capsule.md" in watcher_text
+          assert "wake-memory-v1" in watcher_text
+          assert "MEMORY_MAX_BYTES = 8192" in watcher_text
           assert re.search(
               r"(?m)^\s*allow_implicit_invocation:\s*true\s*$",
               agent_text,

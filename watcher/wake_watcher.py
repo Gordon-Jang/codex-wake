@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""WAKE v0.4.0: checkpoint-first, job-first Codex continuation.
+"""WAKE v0.5.0: memory-capsule-first, checkpoint-backed Codex continuation.
 
 WAKE does not resume or take ownership of an existing Desktop thread.
-It tracks a durable job, waits for ordinary included usage to return, then
-starts a NEW lightweight Codex exec thread that reads only the checkpoint.
+It persists a durable job, projects a small cross-model memory capsule from the
+structured checkpoint, waits for ordinary included usage to return, then starts
+a NEW lightweight Codex exec thread that reads the capsule before any fallback.
 """
 
 from __future__ import annotations
@@ -24,7 +25,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
+MEMORY_FORMAT = "wake-memory-v1"
+MEMORY_MAX_BYTES = 8192
+MEMORY_PREPARE_PERCENT = 80
+MEMORY_HIGH_PERCENT = 90
+MEMORY_FINAL_PERCENT = 95
 SKILL_ROOT = Path.home() / ".codex" / "skills" / "wake"
 WAKE_HOME = Path.home() / ".codex" / "wake"
 JOBS_DIR = WAKE_HOME / "jobs"
@@ -124,6 +130,10 @@ def checkpoint_path(job_id: str) -> Path:
     return job_dir(job_id) / "checkpoint.md"
 
 
+def memory_path(job_id: str) -> Path:
+    return job_dir(job_id) / "memory-capsule.md"
+
+
 def run_dir(job_id: str) -> Path:
     return job_dir(job_id) / "runs"
 
@@ -207,6 +217,217 @@ Update this file after every meaningful milestone and before long-running work.
 """
 
 
+def parse_checkpoint_sections(text: str) -> dict[str, str]:
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in text.splitlines():
+        if line.startswith("## "):
+            current = line[3:].strip()
+            sections.setdefault(current, [])
+            continue
+        if current is not None:
+            sections[current].append(line)
+    return {name: "\n".join(lines).strip() for name, lines in sections.items()}
+
+
+def clip_memory_text(text: str, limit: int) -> str:
+    clean = text.strip()
+    if not clean:
+        return "- None recorded."
+    if len(clean) <= limit:
+        return clean
+    clipped = clean[: max(0, limit - 45)].rstrip()
+    return clipped + "\n- … truncated; see checkpoint.md for detail."
+
+
+def render_memory_capsule(job: dict[str, Any], checkpoint_text: str) -> str:
+    sections = parse_checkpoint_sections(checkpoint_text)
+    scale = 1.0
+    base_limits = {
+        "goal": 500,
+        "current": 700,
+        "facts": 1100,
+        "decisions": 900,
+        "constraints": 800,
+        "files": 600,
+        "next": 1200,
+        "blockers": 500,
+    }
+
+    def section(name: str) -> str:
+        return sections.get(name, "").strip()
+
+    def build(limits: dict[str, int]) -> str:
+        facts = "\n".join(x for x in (section("Completed"), section("Verification")) if x)
+        decisions = "\n".join(x for x in (section("Decisions"), section("Do not repeat")) if x)
+        return f"""# WAKE_MEMORY_CAPSULE_V1
+
+This is compact task-state serialization, not a chat transcript or chat summary.
+Job: {job["jobId"]}
+Policy: capsule_first / do_not_replay
+
+## Objective
+{clip_memory_text(section("Goal"), limits["goal"])}
+
+## Current position
+{clip_memory_text(section("Current state"), limits["current"])}
+
+## Verified facts
+{clip_memory_text(facts, limits["facts"])}
+
+## Decisions / do not repeat
+{clip_memory_text(decisions, limits["decisions"])}
+
+## Constraints
+{clip_memory_text(section("Constraints"), limits["constraints"])}
+
+## Active files
+{clip_memory_text(section("Files changed"), limits["files"])}
+
+## Next actions
+{clip_memory_text(section("Next actions"), limits["next"])}
+
+## Blocker
+{clip_memory_text(section("Blockers"), limits["blockers"])}
+
+## Resume policy
+Read this capsule first. Do not reconstruct or replay the old conversation.
+Inspect minimal live workspace state next. Read checkpoint.md only when this capsule
+is insufficient, inconsistent with live state, or explicitly points to more detail.
+"""
+
+    for _ in range(8):
+        limits = {k: max(120, int(v * scale)) for k, v in base_limits.items()}
+        capsule = build(limits)
+        if len(capsule.encode("utf-8")) <= MEMORY_MAX_BYTES:
+            return capsule
+        scale *= 0.72
+    raise WakeError("could not compact memory capsule below size limit")
+
+
+def refresh_memory_from_checkpoint(job: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
+    jid = str(job["jobId"])
+    cp_path = checkpoint_path(jid)
+    if not cp_path.exists():
+        raise WakeError(f"checkpoint is missing: {cp_path}")
+    cp_stat = cp_path.stat()
+    mem_path = memory_path(jid)
+    if (
+        not force
+        and mem_path.exists()
+        and int(job.get("memoryCheckpointMtimeNs") or 0) == int(cp_stat.st_mtime_ns)
+    ):
+        changed = False
+        metadata = {
+            "version": VERSION,
+            "memoryFormat": MEMORY_FORMAT,
+            "memoryPath": str(mem_path),
+            "contextPolicy": "capsule_first",
+            "historyPolicy": "do_not_replay",
+            "memorySizeBytes": mem_path.stat().st_size,
+        }
+        for key, value in metadata.items():
+            if job.get(key) != value:
+                job[key] = value
+                changed = True
+        if changed:
+            save_job(job)
+        return job
+
+    checkpoint_text = cp_path.read_text(encoding="utf-8")
+    capsule = render_memory_capsule(job, checkpoint_text)
+    mem_path.write_text(capsule, encoding="utf-8")
+    size = mem_path.stat().st_size
+    if size > MEMORY_MAX_BYTES:
+        raise WakeError(f"memory capsule exceeds {MEMORY_MAX_BYTES} bytes")
+
+    job["version"] = VERSION
+    job["memoryFormat"] = MEMORY_FORMAT
+    job["memoryPath"] = str(mem_path)
+    job["contextPolicy"] = "capsule_first"
+    job["historyPolicy"] = "do_not_replay"
+    job["memoryReady"] = "REPLACE_ME" not in checkpoint_text
+    job["memoryUpdatedAt"] = now()
+    job["memoryCheckpointMtimeNs"] = int(cp_stat.st_mtime_ns)
+    job["memorySizeBytes"] = size
+    job["memoryGeneration"] = int(job.get("memoryGeneration") or 0) + 1
+    save_job(job)
+    return job
+
+
+def memory_status(job_id: str) -> dict[str, Any]:
+    job = load_job(job_id)
+    cp = checkpoint_path(job_id)
+    mem = memory_path(job_id)
+    checkpoint_mtime = cp.stat().st_mtime_ns if cp.exists() else None
+    recorded_mtime = job.get("memoryCheckpointMtimeNs")
+    return {
+        "jobId": job_id,
+        "memoryFormat": job.get("memoryFormat"),
+        "memoryPath": str(mem),
+        "memoryExists": mem.exists(),
+        "memoryReady": bool(job.get("memoryReady")),
+        "memorySizeBytes": mem.stat().st_size if mem.exists() else None,
+        "memoryMaxBytes": MEMORY_MAX_BYTES,
+        "memoryUpdatedAt": job.get("memoryUpdatedAt"),
+        "memoryGeneration": job.get("memoryGeneration"),
+        "contextPolicy": job.get("contextPolicy"),
+        "historyPolicy": job.get("historyPolicy"),
+        "checkpointNewerThanMemory": (
+            checkpoint_mtime is not None
+            and recorded_mtime is not None
+            and int(checkpoint_mtime) != int(recorded_mtime)
+        ),
+        "memoryPressure": job.get("memoryPressure"),
+        "memorySealedAt": job.get("memorySealedAt"),
+    }
+
+
+def quota_used_percent(summary: dict[str, Any]) -> int | None:
+    values: list[int] = []
+    limits = summary.get("rateLimits")
+    if isinstance(limits, dict):
+        for key in ("primary", "secondary"):
+            item = limits.get(key)
+            if isinstance(item, dict):
+                value = item.get("usedPercent")
+                if isinstance(value, (int, float)):
+                    values.append(max(0, min(100, int(value))))
+    return max(values) if values else None
+
+
+def memory_pressure_level(used_percent: int | None) -> str:
+    if used_percent is None:
+        return "unknown"
+    if used_percent >= MEMORY_FINAL_PERCENT:
+        return "final"
+    if used_percent >= MEMORY_HIGH_PERCENT:
+        return "high"
+    if used_percent >= MEMORY_PREPARE_PERCENT:
+        return "prepare"
+    return "normal"
+
+
+def update_memory_pressure(job: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
+    used = quota_used_percent(summary)
+    pressure = memory_pressure_level(used)
+    changed = job.get("quotaUsedPercent") != used or job.get("memoryPressure") != pressure
+    job["quotaUsedPercent"] = used
+    job["memoryPressure"] = pressure
+
+    if used is not None and used >= MEMORY_HIGH_PERCENT:
+        job = refresh_memory_from_checkpoint(job)
+        cp_mtime = job.get("memoryCheckpointMtimeNs")
+        if cp_mtime is not None and job.get("memorySealedCheckpointMtimeNs") != cp_mtime:
+            job["memorySealedCheckpointMtimeNs"] = cp_mtime
+            job["memorySealedAt"] = now()
+            changed = True
+
+    if changed:
+        save_job(job)
+    return job
+
+
 def create_job(
     thread_id: str,
     cwd: str | None,
@@ -246,6 +467,18 @@ def create_job(
         "currentThreadId": thread_id,
         "cwd": str(root),
         "checkpointPath": str(checkpoint_path(jid)),
+        "memoryPath": str(memory_path(jid)),
+        "memoryFormat": MEMORY_FORMAT,
+        "contextPolicy": "capsule_first",
+        "historyPolicy": "do_not_replay",
+        "memoryReady": False,
+        "memoryUpdatedAt": None,
+        "memoryCheckpointMtimeNs": None,
+        "memorySizeBytes": None,
+        "memoryGeneration": 0,
+        "memoryPressure": "unknown",
+        "memorySealedAt": None,
+        "memorySealedCheckpointMtimeNs": None,
         "state": "draft",
         "checkpointReady": False,
         "generation": 0,
@@ -261,7 +494,7 @@ def create_job(
         "lastRunLog": None,
     }
     save_job(job)
-    return job
+    return refresh_memory_from_checkpoint(job, force=True)
 
 
 def arm_job(job_id: str) -> dict[str, Any]:
@@ -272,6 +505,9 @@ def arm_job(job_id: str) -> dict[str, Any]:
         raise WakeError("checkpoint still contains REPLACE_ME; fill Goal and Next actions first")
     if cp_path.stat().st_size > 65536:
         raise WakeError("checkpoint exceeds 64 KiB; compact it before arming")
+    job = refresh_memory_from_checkpoint(job, force=True)
+    if not job.get("memoryReady"):
+        raise WakeError("memory capsule is not ready; fill the checkpoint first")
     job["checkpointReady"] = True
     job["state"] = "monitoring"
     job["lastError"] = None
@@ -280,7 +516,7 @@ def arm_job(job_id: str) -> dict[str, Any]:
 
 
 def pause_job(job_id: str, reason: str) -> dict[str, Any]:
-    job = load_job(job_id)
+    job = refresh_memory_from_checkpoint(load_job(job_id))
     job["state"] = "waiting_user"
     job["pauseReason"] = reason.strip() or "waiting for user"
     save_job(job)
@@ -288,7 +524,7 @@ def pause_job(job_id: str, reason: str) -> dict[str, Any]:
 
 
 def rearm_job(job_id: str) -> dict[str, Any]:
-    job = load_job(job_id)
+    job = refresh_memory_from_checkpoint(load_job(job_id))
     if job.get("state") == "completed":
         raise WakeError("completed jobs are immutable; create a new job instead")
     if not job.get("checkpointReady"):
@@ -301,7 +537,7 @@ def rearm_job(job_id: str) -> dict[str, Any]:
 
 
 def stop_job(job_id: str) -> dict[str, Any]:
-    job = load_job(job_id)
+    job = refresh_memory_from_checkpoint(load_job(job_id))
     if job.get("state") == "completed":
         return job
     job["state"] = "stopped"
@@ -312,7 +548,7 @@ def stop_job(job_id: str) -> dict[str, Any]:
 
 
 def complete_job(job_id: str) -> dict[str, Any]:
-    job = load_job(job_id)
+    job = refresh_memory_from_checkpoint(load_job(job_id))
     job["state"] = "completed"
     job["completedAt"] = now()
     job["lastRunPid"] = None
@@ -495,40 +731,59 @@ def next_sleep(summary: dict[str, Any]) -> int:
 
 def continuation_prompt(job: dict[str, Any]) -> str:
     jid = str(job["jobId"])
+    state = str(state_path(jid))
+    mem = str(memory_path(jid))
     cp = str(job["checkpointPath"])
     cwd = str(job["cwd"])
     helper = str(SKILL_ROOT / "watcher" / "wake_watcher.py")
-    return f"""Continue WAKE job {jid}. This is a checkpoint handoff, not a chat resume.
+    return f"""Continue WAKE job {jid}. This is a memory-capsule handoff, not a chat resume.
 
-Read FIRST and treat as authoritative:
+Recovery order:
+1. Read state.json metadata first:
+{state}
+2. Read the compact memory capsule and treat it as primary task memory:
+{mem}
+3. Inspect only the minimum live workspace state needed in:
+{cwd}
+4. Read checkpoint.md only if the capsule is insufficient, inconsistent with live state,
+   or explicitly points to more detail:
 {cp}
 
-Then inspect only the minimum live workspace state needed in:
-{cwd}
-
-If that directory is inside a Git worktree, normally inspect:
+For Git checks, first run a quiet worktree probe such as:
+- git rev-parse --is-inside-work-tree
+Only when that succeeds, inspect:
 - git status --short
 - git diff --stat
-If it is not a Git worktree, skip Git checks without treating that as an error.
+If the probe fails, skip all other Git commands. Do not run git diff outside a worktree.
 
-Do NOT reconstruct, resume, or reread the previous chat/thread. Do NOT repeat work listed
-under Completed or Do not repeat unless verification is demonstrably stale.
+Do not read SKILL.md just to recover this job; this handoff prompt already contains the
+recovery protocol.
 
-Continue from Next actions and work toward the Goal. Update the checkpoint after every
-meaningful milestone and before long-running or risky operations. Keep it concise.
+Do NOT reconstruct, resume, reread, or summarize the previous chat/thread. The capsule is
+task-state serialization, not a compressed transcript. Do NOT repeat verified work or
+abandoned approaches unless live evidence shows the capsule is stale.
 
-If user input/manual action is required, update the checkpoint, then run:
+Continue from Next actions and work toward the Goal. After each meaningful milestone and
+before long-running, risky, or quota-heavy work:
+- update checkpoint.md concisely;
+- run: python "{helper}" memory-refresh --job-id {jid}
+
+If user input/manual action is required, update the checkpoint, refresh memory, then run:
 python "{helper}" job-pause --job-id {jid} --reason "<short reason>"
 
-When the Goal is fully verified complete, update the checkpoint, then run:
+When the Goal is fully verified complete, update the checkpoint, refresh memory, then run:
 python "{helper}" job-complete --job-id {jid}
 
-If usage quota stops execution, exit normally; WAKE will create the next checkpoint handoff.
+If usage quota stops execution, exit normally; WAKE will use the latest capsule on the
+next handoff.
 """
 
 
 def launch_handoff(job: dict[str, Any]) -> dict[str, Any]:
     jid = str(job["jobId"])
+    job = refresh_memory_from_checkpoint(job)
+    if not job.get("memoryReady"):
+        raise WakeError("memory capsule is not ready")
     source_state = str(job.get("state") or "")
     cwd = Path(str(job["cwd"]))
     if not cwd.exists():
@@ -704,6 +959,13 @@ def process_once(app: StdioAppServer) -> int:
     jobs = [j for j in all_jobs() if j.get("checkpointReady") and j.get("state") not in {"completed", "draft", "stopped"}]
     if not jobs:
         return 60
+
+    for seed in jobs:
+        try:
+            refresh_memory_from_checkpoint(load_job(str(seed["jobId"])))
+        except Exception as exc:
+            log(f"job {seed.get('jobId')} memory refresh failed: {exc}")
+
     try:
         summary = summarize_quota(app.request("account/rateLimits/read"))
     except Exception as exc:
@@ -718,6 +980,15 @@ def process_once(app: StdioAppServer) -> int:
         try:
             job = load_job(jid)
         except Exception:
+            continue
+        try:
+            job = refresh_memory_from_checkpoint(job)
+            job = update_memory_pressure(job, summary)
+        except Exception as exc:
+            job["state"] = "needs_attention"
+            job["lastError"] = f"memory capsule refresh failed: {exc}"
+            save_job(job)
+            log(f"job {jid} needs attention: memory capsule refresh failed: {exc}")
             continue
         state = str(job.get("state"))
         if state in {"completed", "draft", "stopped", "waiting_user", "needs_attention"}:
@@ -779,6 +1050,8 @@ def watcher_status() -> dict[str, Any]:
         "jobCount": len(jobs),
         "stateCounts": counts,
         "currentThreadEnvPresent": bool(os.environ.get("CODEX_THREAD_ID")),
+        "memoryFormat": MEMORY_FORMAT,
+        "memoryMaxBytes": MEMORY_MAX_BYTES,
     }
 
 
@@ -818,6 +1091,8 @@ def doctor() -> int:
         "codex": shutil.which("codex"),
         "windowsNoWindow": bool(hidden_creationflags()) if os.name == "nt" else None,
         "watcher": watcher_status(),
+        "memoryFormat": MEMORY_FORMAT,
+        "memoryMaxBytes": MEMORY_MAX_BYTES,
     }
     app = StdioAppServer()
     try:
@@ -853,6 +1128,7 @@ def main() -> int:
     for name in (
         "run", "once", "quota", "status", "doctor", "job-list",
         "job-current", "job-stop-current", "job-rearm-current", "job-complete-current",
+        "memory-refresh-current", "memory-status-current",
     ):
         sub.add_parser(name)
 
@@ -867,7 +1143,7 @@ def main() -> int:
     jcc.add_argument("--goal")
     jcc.add_argument("--model")
     jcc.add_argument("--reasoning-effort")
-    for name in ("job-arm", "job-status", "job-rearm", "job-stop", "job-complete"):
+    for name in ("job-arm", "job-status", "job-rearm", "job-stop", "job-complete", "memory-refresh", "memory-status"):
         sp = sub.add_parser(name)
         sp.add_argument("--job-id", required=True)
     jp = sub.add_parser("job-pause")
@@ -907,6 +1183,10 @@ def main() -> int:
         print_json(pause_job(args.job_id, args.reason)); return 0
     if args.cmd == "job-complete":
         print_json(complete_job(args.job_id)); return 0
+    if args.cmd == "memory-refresh":
+        print_json(refresh_memory_from_checkpoint(load_job(args.job_id), force=True)); return 0
+    if args.cmd == "memory-status":
+        print_json(memory_status(args.job_id)); return 0
     if args.cmd == "job-rearm-current":
         print_json(rearm_job(str(current_job(True)["jobId"]))); return 0
     if args.cmd == "job-stop-current":
@@ -915,6 +1195,10 @@ def main() -> int:
         print_json(pause_job(str(current_job(True)["jobId"]), args.reason)); return 0
     if args.cmd == "job-complete-current":
         print_json(complete_job(str(current_job(True)["jobId"]))); return 0
+    if args.cmd == "memory-refresh-current":
+        print_json(refresh_memory_from_checkpoint(current_job(True), force=True)); return 0
+    if args.cmd == "memory-status-current":
+        print_json(memory_status(str(current_job(True)["jobId"]))); return 0
     app = StdioAppServer()
     try:
         if args.cmd == "quota":
