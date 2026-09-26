@@ -27,6 +27,14 @@ When included usage is unavailable, WAKE waits locally without making model turn
 
 WAKE does not bypass OpenAI usage limits, credits, rate limits, or safety controls.
 
+## Desktop vs CLI wake boundary
+
+The v0.4 watcher currently implements a **CLI continuation adapter**. After quota recovery it starts a new `codex exec` thread from the checkpoint; that proves checkpoint continuation, not resurrection of the interrupted Codex Desktop conversation.
+
+A Desktop session/Goal may be called successfully awakened only when WAKE has a supported Desktop thread/Goal bridge and verifies the returned thread/Goal status on the Desktop-owned runtime. If that bridge is unavailable, diagnostics must report `cli_continuation_only` and must not describe a successful CLI handoff as a Desktop wake.
+
+Therefore, CLI self-tests validate checkpoint loading, new-thread creation, retry behavior, and job completion. They do **not** by themselves validate Desktop-session wake behavior.
+
 ## Requirements
 
 - Codex CLI available as `codex`
