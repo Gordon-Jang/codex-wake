@@ -1,9 +1,9 @@
-# Checkpoint-first quota watcher — v0.4
+# Memory-capsule quota watcher — v0.5
 
 ## Goal
 
-Continue a long Codex task across included-usage windows without reopening the entire
-old conversation and without competing with Codex Desktop for the same thread writer.
+Continue a long Codex task across included-usage windows without replaying the old
+conversation and without competing with Codex Desktop for the same thread writer.
 
 The durable object is a **WAKE job**, not a Codex thread.
 
@@ -16,42 +16,103 @@ The durable object is a **WAKE job**, not a Codex thread.
 └─ jobs/
    └─ <job-id>/
       ├─ state.json
+      ├─ memory-capsule.md
       ├─ checkpoint.md
       └─ runs/
          └─ run-0001-<timestamp>.jsonl
 ```
 
-The Skill install lives separately under `~/.codex/skills/wake`. Reinstalling the Skill
-therefore does not erase job/checkpoint history.
+The Skill install lives separately under `~/.codex/skills/wake`.
+
+## Two state layers
+
+`checkpoint.md` is the detailed, structured execution state written by the active agent.
+
+`memory-capsule.md` is a deterministic compact projection of the checkpoint. It is
+limited to 8 KiB and follows `WAKE_MEMORY_CAPSULE_V1`.
+
+The capsule contains:
+
+- Objective
+- Current position
+- Verified facts
+- Decisions / do not repeat
+- Constraints
+- Active files
+- Next actions
+- Blocker
+- Resume policy
+
+It intentionally does **not** contain chat chronology or a rewritten transcript.
+
+The related `state.json` metadata includes:
+
+```json
+{
+  "memoryFormat": "wake-memory-v1",
+  "contextPolicy": "capsule_first",
+  "historyPolicy": "do_not_replay"
+}
+```
 
 ## Initial registration
 
 `$wake` runs inside the source Codex conversation and requires `CODEX_THREAD_ID`.
-The thread id is recorded only as provenance. It is never used for automatic resume.
+The source thread id is provenance only.
 
-The current model writes a compact checkpoint and then arms the job.
+The current agent fills `checkpoint.md`; `job-arm` then generates the first capsule.
 
 ```text
 draft
   |
-  | checkpoint filled + job-arm
+  | checkpoint filled
+  | memory capsule generated
+  | job-arm
   v
 monitoring
 ```
 
 A draft job is never launched.
 
+## Local memory refresh
+
+`memory-refresh` reads `checkpoint.md`, selects the task-state sections, applies
+per-section limits, and writes `memory-capsule.md`. It does not call a model.
+
+The watcher also compares checkpoint mtime with `memoryCheckpointMtimeNs`. If the
+checkpoint is newer, the next local poll refreshes the capsule automatically.
+
+This makes capsule generation independent from quota availability. Even if the model can
+no longer run, a checkpoint that was already written can still be projected into the
+short recovery memory locally.
+
+## Pre-quota sealing
+
+The watcher reads `account/rateLimits/read` and derives memory pressure from the highest
+returned primary/secondary `usedPercent`:
+
+```text
+<80%   normal
+80-89  prepare
+90-94  high
+95+    final
+```
+
+At 90% or above, WAKE ensures the latest checkpoint projection is present and records:
+
+- `memorySealedAt`
+- `memorySealedCheckpointMtimeNs`
+
+If checkpoint mtime changes after a seal, the next poll creates a new seal.
+
+No model turn is started merely to seal memory.
+
 ## Quota authority
 
-WAKE reads `account/rateLimits/read` from one hidden persistent local
-`codex app-server`.
-
 - `ordinaryUsageAllowed == false` means wait.
-- `ordinaryUsageAllowed == true` permits a checkpoint handoff.
-- null/unknown means do not infer recovery.
+- `ordinaryUsageAllowed == true` permits a handoff.
+- null/unknown never implies recovery.
 - `resetsAt` is only a scheduling hint.
-
-Multiple windows can exist. WAKE always re-reads the authoritative boolean before launch.
 
 ## State machine
 
@@ -79,7 +140,8 @@ running  -- starts NEW codex exec thread
    +--> needs_attention    (non-retryable failure / retry limit exceeded)
 ```
 
-`waiting_user`, `needs_attention`, `stopped`, `draft`, and `completed` are not auto-launched.
+`waiting_user`, `needs_attention`, `stopped`, `draft`, and `completed` are not
+auto-launched.
 
 ## Handoff contract
 
@@ -91,45 +153,40 @@ codex exec --json -C <workspace> --add-dir <job-dir> ...
 
 It does **not** use `codex exec resume`.
 
-The continuation prompt requires the new thread to:
+The new thread reads in this order:
 
-1. read `checkpoint.md` first;
-2. normally inspect only `git status --short` and `git diff --stat`;
-3. continue from `Next actions`;
-4. skip work already listed under `Completed` or `Do not repeat`;
-5. update the checkpoint after meaningful milestones;
-6. call `job-pause` when user input is required;
-7. call `job-complete` after the Goal is fully verified.
+1. `state.json`
+2. `memory-capsule.md`
+3. minimal live workspace state; probe Git with `git rev-parse --is-inside-work-tree`
+   before any `git status` / `git diff` commands
+4. `checkpoint.md` only if more detail is actually required
 
-## Why not resume the old Desktop thread?
+The prompt explicitly forbids reconstructing, rereading, or summarizing the previous
+conversation.
 
-In testing, detached `codex exec resume <thread-id>` failed with:
-
-```text
-thread-store conflict: thread ... already has an active writer
-```
-
-Codex Desktop already owned that thread. v0.4 avoids that control-plane conflict entirely
-by making a new thread for each quota handoff.
+After a meaningful milestone, the continuation updates checkpoint and runs
+`memory-refresh`. Pause and complete commands also refresh the capsule before changing
+state.
 
 ## Desktop wake acceptance criteria
 
-The current watcher path is `cli_continuation_only`: it can prove that a new CLI continuation thread read the checkpoint and continued the task, but it does not directly wake the interrupted Desktop-owned thread or Goal.
+The current watcher path is still `cli_continuation_only`. It proves that a new CLI
+continuation thread consumed the persisted task state; it does not directly wake the
+interrupted Desktop-owned thread or Goal.
 
-Treat Desktop wake as a separate capability. It is successful only when a supported Desktop thread/Goal bridge is available and WAKE verifies the returned thread/Goal status on the Desktop-owned runtime. Until that bridge exists and is tested, CLI continuation results must not be presented as Desktop wake results.
+Desktop wake is successful only when a supported Desktop thread/Goal bridge exists and
+WAKE verifies the returned state on the Desktop-owned runtime.
 
 ## Failure handling
 
-WAKE distinguishes transient failures from terminal ones:
-
-- selected-model capacity and common temporary network/HTTP 502/503/504 failures enter `retry_waiting`;
-- retry delay grows exponentially from 60 seconds, is capped at 15 minutes, and stops after 8 retries;
-- if a continuation process exits while quota is available for a non-retryable reason, WAKE sets `needs_attention`;
-- if it exits while quota is unavailable, WAKE returns to `quota_waiting`;
-- missing workspace paths or launch errors also become `needs_attention`.
+- model capacity and temporary network/HTTP 502/503/504 errors enter `retry_waiting`;
+- retry delay grows exponentially from 60 seconds, capped at 15 minutes;
+- retry stops after 8 transient failures;
+- if a run ends while quota is blocked, return to `quota_waiting`;
+- non-retryable failures become `needs_attention`.
 
 ## Context-efficiency rule
 
-The checkpoint should stay small and operational. Record conclusions, file paths, short
-verification results, and next actions. Do not paste old chat history, full logs, or large
-diffs. Old chats remain available as archives if a human later needs them.
+The capsule is task-state serialization, not a compressed transcript. The active agent
+must still write important state into checkpoint before it is lost. Old chats remain
+archives and are not the default recovery source.

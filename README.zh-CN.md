@@ -2,44 +2,100 @@
 
 **wake** 是一个用于跨多个额度窗口持续执行长任务的 Codex Skill。
 
-## v0.4.0：恢复任务，不恢复旧聊天
+## v0.5.0：Memory Capsule 优先
 
-旧版 WAKE 尝试恢复原来的 Codex thread。在 Codex Desktop 中，这可能和 Desktop
-已经持有的 active writer 冲突。v0.4 把恢复单位从 thread 改成了持久化的 **job**。
+WAKE 不再把旧聊天当成持久对象，而是保存一个 **job**，并在：
 
-每个 job 都保存一个紧凑 checkpoint：
+`~/.codex/wake/jobs/<job-id>/`
 
-`~/.codex/wake/jobs/<job-id>/checkpoint.md`
+维护两层任务状态：
 
-额度耗尽时，WAKE 只在本地等待，不发送模型 turn。只有当
-`ordinaryUsageAllowed == true` 时，才启动一个新的轻量 `codex exec` thread，
-先读 checkpoint，再只继续未完成的工作。
+```text
+state.json
+memory-capsule.md
+checkpoint.md
+runs/
+```
 
-## 这版解决什么
+`memory-capsule.md` 是恢复时第一优先级的短记忆，限制在 8 KiB 以内，并且明确
+**不是聊天重写，也不是聊天摘要**。它只保留任务状态：
 
-- 避免 `thread already has an active writer` 冲突；
-- 不依赖 Codex Desktop 的 Goal“继续”按钮；
-- 不依赖 Windows 上当前仍较实验性的 app-server daemon；
-- 不再为了续跑重新灌入超长旧聊天；
-- 额度查询使用一个隐藏、持久的 `codex app-server`；
-- 绝不把 reset time 当作额度已经恢复的证明。
+- 最终目标；
+- 当前做到哪里；
+- 已验证事实；
+- 已做决策 / 不要重复的路线；
+- 约束；
+- 当前相关文件；
+- 下一步；
+- 阻塞项；
+- 恢复规则。
 
-WAKE 不绕过 OpenAI 的额度、credits、rate limits 或安全机制。
+`checkpoint.md` 则保留更详细的结构化执行状态。
+
+capsule 由 watcher 在本地从 checkpoint 投影生成，因此刷新 capsule 不需要再消耗
+一次模型调用。
+
+## 恢复顺序
+
+额度恢复后，WAKE 会启动一个新的轻量 `codex exec` continuation。新线程必须按顺序：
+
+1. 读 `state.json`；
+2. 读 `memory-capsule.md`，把它当作主任务记忆；
+3. 只检查最少量的实时工作区状态；先探测是否为 Git worktree，再决定是否运行 status/diff；
+4. 只有 capsule 信息不足时才读 `checkpoint.md`；
+5. 从 Next actions 继续。
+
+禁止新线程重新构建、重读或总结原来的旧聊天。
+
+## 额度耗尽前的记忆封存
+
+WAKE 本地轮询 `account/rateLimits/read`，记录 primary/secondary 中最高的使用百分比：
+
+- <80%：`normal`
+- 80-89%：`prepare`
+- 90-94%：`high`
+- 95%+：`final`
+
+达到 90% 或以上时，watcher 会把当前最新 checkpoint 投影重新封存进 capsule。
+如果之后 checkpoint 又发生变化，下次 watcher 轮询会重新生成新的封存版本。
+
+这个过程不会凭空补出没有写进 `checkpoint.md` 的内容，所以当前 AI 仍必须在：
+
+- 完成重要子任务后；
+- 做出关键决定后；
+- 长时间命令前；
+- 高风险修改前；
+- 高额度操作前；
+
+及时更新 checkpoint。
 
 ## Desktop 与 CLI 唤醒边界
 
-v0.4 watcher 当前实现的是 **CLI continuation adapter**。额度恢复后，它会从 checkpoint 启动一个新的 `codex exec` thread；这只能证明 checkpoint 续接成功，不能等同于原 Codex Desktop 会话被重新唤醒。
+当前 v0.5 watcher 仍然实现的是 **CLI continuation adapter**。成功把 capsule 交给
+新的 `codex exec` thread，并不等于原来的 Codex Desktop 会话或 Goal 被直接唤醒。
 
-只有当 WAKE 存在受支持的 Desktop thread/Goal bridge，并且在 Desktop 所属运行时中验证返回的 thread/Goal 状态后，才能宣称 Desktop 会话或 Goal 唤醒成功。如果该 bridge 不可用，诊断必须明确报告 `cli_continuation_only`，不能把成功的 CLI handoff 描述成 Desktop 唤醒。
+只有当 WAKE 存在受支持的 Desktop thread/Goal bridge，并且在 Desktop 所属运行时中
+验证了返回状态，才能宣称 Desktop wake 成功。否则诊断必须明确报告
+`cli_continuation_only`。
 
-因此 CLI 自测可以验证 checkpoint 读取、新 thread 创建、重试逻辑和 job 完成，但它本身不能证明 Desktop 会话唤醒通过。
+## 为什么这样设计
+
+- 避免 Desktop active-writer 冲突；
+- 显著减少额度恢复后需要重新读取的旧上下文；
+- 让 Codex 或其他 AI 都可以读取同一个模型无关短记忆文件；
+- 旧聊天只作为档案，而不是默认恢复来源；
+- capsule 刷新是本地文件操作，不额外消耗模型 turn；
+- 继续以 `ordinaryUsageAllowed` 作为额度恢复权威信号；
+- 临时模型满载/网络故障使用有限退避重试。
+
+WAKE 不绕过 OpenAI 的额度、credits、rate limits 或安全机制。
 
 ## 环境要求
 
 - 可用的 Codex CLI：`codex`
 - Python 3
 - 已完成 Codex 登录
-- 首次 `$wake` 创建 job 时，Codex shell/tool 环境能提供 `CODEX_THREAD_ID`
+- 首次 `$wake` 创建 job 时，Codex shell/tool 环境可以提供 `CODEX_THREAD_ID`
 
 ## Windows 安装
 
@@ -53,11 +109,11 @@ cd codex-wake
 
 `%USERPROFILE%\.codex\skills\wake`
 
-持久 job/checkpoint 单独保存在：
+持久任务状态单独保存在：
 
 `%USERPROFILE%\.codex\wake`
 
-因此重新安装 Skill 不会删除任务 checkpoint。
+重新安装 Skill 不会删除已有 job/checkpoint/capsule。
 
 ## 使用
 
@@ -67,14 +123,8 @@ cd codex-wake
 $wake
 ```
 
-Skill 会：
-
-1. 定义当前任务 Goal；
-2. 创建 job；
-3. 根据当前上下文生成精简 checkpoint；
-4. arm job；
-5. 启动本地 watcher；
-6. 继续当前任务。
+Skill 会创建 job、根据当前任务上下文填写 checkpoint、arm job、生成第一份
+memory capsule、启动 watcher，然后继续当前任务。
 
 常用诊断：
 
@@ -82,32 +132,29 @@ Skill 会：
 python "$HOME\.codex\skills\wake\watcher\wake_watcher.py" doctor
 python "$HOME\.codex\skills\wake\watcher\wake_watcher.py" status
 python "$HOME\.codex\skills\wake\watcher\wake_watcher.py" job-list
+python "$HOME\.codex\skills\wake\watcher\wake_watcher.py" memory-status --job-id <job-id>
 ```
 
-高级用法中，`job-create` / `job-create-current` 还支持 `--model` 与 `--reasoning-effort`；不指定时沿用 Codex 的正常配置。
+立即本地刷新 capsule：
+
+```powershell
+python "$HOME\.codex\skills\wake\watcher\wake_watcher.py" memory-refresh --job-id <job-id>
+```
+
+高级用法中，`job-create` / `job-create-current` 仍支持 `--model` 与
+`--reasoning-effort`；不指定时沿用 Codex 正常配置。
 
 ## Job 状态
 
-- `draft`：checkpoint 尚未完成，不能自动续跑；
-- `monitoring`：当前工作正常，watcher 只监控额度；
-- `quota_waiting`：普通 included usage 不可用；
-- `running`：新的 checkpoint handoff thread 正在执行；
-- `retry_waiting`：遇到临时容量/网络故障，按有限退避重试；
-- `waiting_user`：需要用户输入/人工操作，不自动启动；
-- `needs_attention`：续跑进程异常结束，不盲目循环；
-- `stopped`：用户停止自动续跑，但保留 checkpoint；
-- `completed`：任务已验证完成，watcher 忽略。
-
-## 续跑约定
-
-新 thread 必须先读 checkpoint，通常只额外检查：
-
-- `git status --short`
-- `git diff --stat`
-
-并明确禁止重新构建、resume 或重读上一条超长聊天。
-
-详细状态机见 [docs/quota-watcher.md](docs/quota-watcher.md)。
+- `draft`：checkpoint 尚未 arm；
+- `monitoring`：当前任务正常工作，watcher 监控额度；
+- `quota_waiting`：普通 included usage 当前不可用；
+- `running`：新的 capsule/checkpoint handoff thread 正在执行；
+- `retry_waiting`：临时容量/网络故障，有限退避重试；
+- `waiting_user`：需要用户/人工动作；
+- `needs_attention`：不可重试或重试耗尽；
+- `stopped`：停止自动续跑，但保留任务状态；
+- `completed`：任务已验证完成。
 
 ## 自测
 
@@ -116,4 +163,5 @@ python -m py_compile .\watcher\wake_watcher.py
 python -m unittest discover -s tests -v
 ```
 
-v0.4.0 已在 Windows 上通过单元测试与恢复额度路径的真实接班验证：新 Codex thread 从 checkpoint 接班、完成并按字节校验测试产物、更新 checkpoint，并最终将 job 标记为 completed。
+v0.5.0 在 v0.4 checkpoint-first 架构上增加了可跨 AI 使用的
+`WAKE_MEMORY_CAPSULE_V1` 短记忆层。

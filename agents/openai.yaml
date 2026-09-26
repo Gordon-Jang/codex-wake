@@ -1,7 +1,7 @@
 interface:
   display_name: "Wake"
-  short_description: "Checkpoint-first continuation for long Codex jobs across quota windows."
-  default_prompt: "Use $wake to persist the current task as a compact checkpoint-backed job. On quota recovery, continue in a new lightweight thread from the checkpoint instead of resuming the old chat."
+  short_description: "Memory-capsule-first continuation for long Codex jobs across quota windows."
+  default_prompt: "Use $wake to persist the current task as a compact cross-model memory capsule plus checkpoint. On quota recovery, continue in a new lightweight thread from the capsule instead of replaying the old chat."
 
 policy:
   allow_implicit_invocation: true
