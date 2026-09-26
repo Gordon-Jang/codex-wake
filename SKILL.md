@@ -24,7 +24,7 @@ Desktop conversation was resumed.
 
 Every WAKE job owns two different state layers:
 
-- `memory-capsule.md`: first-priority, cross-model task memory; maximum 8 KiB.
+- `memory-capsule.md`: first-priority, cross-model task memory; maximum 8 KiB. It begins with `# WAKE_MEMORY_CAPSULE_V1`.
 - `checkpoint.md`: the more detailed structured execution record.
 
 The capsule is **not** a rewritten conversation and is **not** a chat summary. It is a
