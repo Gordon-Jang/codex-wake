@@ -11,6 +11,16 @@ description: >
 
 WAKE persists the TASK, not the chat thread.
 
+## Desktop / CLI handoff boundary
+
+The watcher currently has a CLI continuation adapter only: after quota recovery it
+starts a new `codex exec` thread from the checkpoint. This is not the same as waking
+the interrupted Desktop thread. A Desktop wake is accepted only when a supported
+Desktop thread/goal bridge is present and its returned thread/goal status is verified;
+otherwise report `cli_continuation_only` explicitly and do not claim that the Desktop
+conversation was resumed. CLI self-tests may validate checkpoint loading and creation
+of a new continuation thread, but they cannot prove Desktop-thread wake behavior.
+
 ## Core rule
 
 Never use `codex exec resume`, `--last`, recency, title, or another heuristic to

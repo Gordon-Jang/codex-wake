@@ -26,6 +26,14 @@
 
 WAKE 不绕过 OpenAI 的额度、credits、rate limits 或安全机制。
 
+## Desktop 与 CLI 唤醒边界
+
+v0.4 watcher 当前实现的是 **CLI continuation adapter**。额度恢复后，它会从 checkpoint 启动一个新的 `codex exec` thread；这只能证明 checkpoint 续接成功，不能等同于原 Codex Desktop 会话被重新唤醒。
+
+只有当 WAKE 存在受支持的 Desktop thread/Goal bridge，并且在 Desktop 所属运行时中验证返回的 thread/Goal 状态后，才能宣称 Desktop 会话或 Goal 唤醒成功。如果该 bridge 不可用，诊断必须明确报告 `cli_continuation_only`，不能把成功的 CLI handoff 描述成 Desktop 唤醒。
+
+因此 CLI 自测可以验证 checkpoint 读取、新 thread 创建、重试逻辑和 job 完成，但它本身不能证明 Desktop 会话唤醒通过。
+
 ## 环境要求
 
 - 可用的 Codex CLI：`codex`

@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## Unreleased
+
+### Changed
+
+- Clarified that the current v0.4 watcher is `cli_continuation_only`: a successful checkpoint handoff to a new `codex exec` thread does not prove the interrupted Codex Desktop session or Goal was awakened.
+- Desktop wake may be claimed only when a supported Desktop thread/Goal bridge is present and its returned state is verified on the Desktop-owned runtime.
+
 ## [0.4.0] - 2026-09-26
 
 ### Changed

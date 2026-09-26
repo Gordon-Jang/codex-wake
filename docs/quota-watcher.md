@@ -112,6 +112,12 @@ thread-store conflict: thread ... already has an active writer
 Codex Desktop already owned that thread. v0.4 avoids that control-plane conflict entirely
 by making a new thread for each quota handoff.
 
+## Desktop wake acceptance criteria
+
+The current watcher path is `cli_continuation_only`: it can prove that a new CLI continuation thread read the checkpoint and continued the task, but it does not directly wake the interrupted Desktop-owned thread or Goal.
+
+Treat Desktop wake as a separate capability. It is successful only when a supported Desktop thread/Goal bridge is available and WAKE verifies the returned thread/Goal status on the Desktop-owned runtime. Until that bridge exists and is tested, CLI continuation results must not be presented as Desktop wake results.
+
 ## Failure handling
 
 WAKE distinguishes transient failures from terminal ones:
@@ -127,4 +133,3 @@ WAKE distinguishes transient failures from terminal ones:
 The checkpoint should stay small and operational. Record conclusions, file paths, short
 verification results, and next actions. Do not paste old chat history, full logs, or large
 diffs. Old chats remain available as archives if a human later needs them.
-
